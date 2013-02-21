@@ -401,6 +401,7 @@ public class QcConnectivityService extends ConnectivityService {
     public static final int EVENT_UPDATE_BLOCKED_UID = 501;
     public static final int EVENT_REPRIORITIZE_DNS = 502;
     public static final int EVENT_CONNECTIVITY_SWITCH = 503;
+    public static final int EVENT_AVOID_UNSUITABLE_WIFI = 504;
 
     private Handler mHandler;
     /**
@@ -3217,7 +3218,10 @@ public class QcConnectivityService extends ConnectivityService {
          */
         private final class SmartConnectivityState extends State {
 
+            private boolean avoidUnsuitableWifi;
+
             public SmartConnectivityState () {
+                avoidUnsuitableWifi = true;
             }
 
             @Override
@@ -3243,7 +3247,7 @@ public class QcConnectivityService extends ConnectivityService {
                 boolean ret = false;
                 if (mNetConfigs[type].isDefault()) {
                     mConnectedDefaultNetworks.add(type);
-                    if (mConnectedDefaultNetworks.size() > 1) {
+                    if (avoidUnsuitableWifi && (mConnectedDefaultNetworks.size() > 1)) {
                         ret = true;
                     }
                 }
@@ -3278,6 +3282,7 @@ public class QcConnectivityService extends ConnectivityService {
                     case HSM_HANDLE_CONNECT :
                     {
                         info = (NetworkInfo) msg.obj;
+                        mConnectedDefaultNetworks.add(info.getType());
                         if (isNetworkSimultaneitySupported(info)) {
                             log("Dual Connectivity Mode detected");
                             deferMessage(msg);
@@ -3300,6 +3305,16 @@ public class QcConnectivityService extends ConnectivityService {
                     {
                         info = (NetworkInfo) msg.obj;
                         handleCaptivePortalTrackerCheck(info);
+                        ret = HANDLED;
+                        break;
+                    }
+                    case EVENT_AVOID_UNSUITABLE_WIFI:
+                    {
+                        avoidUnsuitableWifi = (msg.arg1 == 1);
+                        log("dual network support " + (avoidUnsuitableWifi ? "enabled":"disabled"));
+                        if (avoidUnsuitableWifi && (mActiveDefaultNetwork == TYPE_WIFI)) {
+                            mNetTrackers[TYPE_MOBILE].reconnect();
+                        }
                         ret = HANDLED;
                         break;
                     }
@@ -3484,6 +3499,12 @@ public class QcConnectivityService extends ConnectivityService {
                         } else {
                             logw("Dns is already prioritized for network " + type);
                         }
+                        ret = HANDLED;
+                        break;
+                    }
+                    case EVENT_AVOID_UNSUITABLE_WIFI:
+                    {
+                        deferMessage(msg);
                         ret = HANDLED;
                         break;
                     }

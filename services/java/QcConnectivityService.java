@@ -3551,7 +3551,8 @@ public class QcConnectivityService extends ConnectivityService {
                 NetworkInfo newNetInfo = getNetworkInfo(myDefaultNet);
 
                 Intent intent = new Intent(ConnectivityManager.CONNECTIVITY_ACTION);
-                intent.putExtra(ConnectivityManager.EXTRA_NETWORK_INFO, newNetInfo);
+                intent.putExtra(ConnectivityManager.EXTRA_NETWORK_INFO, new NetworkInfo(newNetInfo));
+                intent.putExtra(ConnectivityManager.EXTRA_NETWORK_TYPE, newNetInfo.getType());
                 if (reason != null && reason.length() > 0) {
                     intent.putExtra(ConnectivityManager.EXTRA_REASON, reason);
                 }
@@ -3593,6 +3594,10 @@ public class QcConnectivityService extends ConnectivityService {
                     //post switch handling in new state
                     mActiveDefaultNetwork = myDefaultNet;
                     updateDefaultRouteMetric(otherDefaultNet);
+                    // Tell VPN of default net switch
+                    mVpn.interfaceStatusChanged(
+                            mNetTrackers[otherDefaultNet].getLinkProperties().getInterfaceName(),
+                            false);
                     sendConnectivitySwitchBroadcast(reason);
                 } else {
                     //pre switch handling in old state

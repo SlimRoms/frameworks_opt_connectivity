@@ -2373,7 +2373,7 @@ public class QcConnectivityService extends ConnectivityService {
             if (TextUtils.equals(mNetTrackers[netType].getNetworkInfo().getReason(),
                                  PhoneConstants.REASON_LINK_PROPERTIES_CHANGED)) {
                 if (isTetheringSupported()) {
-                    mTethering.handleTetherIfaceChange();
+                    mTethering.handleTetherIfaceChange(mNetTrackers[netType].getNetworkInfo());
                 }
             }
         }
@@ -4142,7 +4142,7 @@ public class QcConnectivityService extends ConnectivityService {
                 if (TextUtils.equals(mNetTrackers[netType].getNetworkInfo().getReason(),
                                      PhoneConstants.REASON_LINK_PROPERTIES_CHANGED)) {
                     if (isTetheringSupported()) {
-                        mTethering.handleTetherIfaceChange();
+                        mTethering.handleTetherIfaceChange(mNetTrackers[netType].getNetworkInfo());
                     }
                 }
             }

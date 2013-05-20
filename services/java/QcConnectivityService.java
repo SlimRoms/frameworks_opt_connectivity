@@ -920,6 +920,11 @@ public class QcConnectivityService extends ConnectivityService {
         if (mLockdownTracker != null) {
             info = mLockdownTracker.augmentNetworkInfo(info);
         }
+        if (info.isConnected() == true &&
+                mActiveDefaultNetwork == TYPE_MOBILE &&
+                    info.getType() == TYPE_WIFI) {
+            info.setDetailedState(DetailedState.VERIFYING_POOR_LINK, null, null);
+        }
         return info;
     }
 
@@ -3584,7 +3589,7 @@ public class QcConnectivityService extends ConnectivityService {
 
                 if (DBG) log(getCurrentState().getName() + " sendConnectivitySwitchBroadcast");
 
-                NetworkInfo newNetInfo = getNetworkInfo(myDefaultNet);
+                NetworkInfo newNetInfo = mNetTrackers[myDefaultNet].getNetworkInfo();
 
                 Intent intent = new Intent(ConnectivityManager.CONNECTIVITY_ACTION);
                 intent.putExtra(ConnectivityManager.EXTRA_NETWORK_INFO, new NetworkInfo(newNetInfo));
@@ -3815,7 +3820,7 @@ public class QcConnectivityService extends ConnectivityService {
                     mConnectedDefaultNetworks.remove(type);
                     // reset ActiveDefault to other and send broadcast
                     mActiveDefaultNetwork = otherDefaultNet;
-                    NetworkInfo otherInfo = getNetworkInfo(otherDefaultNet);
+                    NetworkInfo otherInfo = mNetTrackers[mActiveDefaultNetwork].getNetworkInfo();
                     otherInfo.setFailover(true);
                     sendConnectedBroadcast(otherInfo);
                     return -1; // defer and transition to parent
@@ -3851,7 +3856,7 @@ public class QcConnectivityService extends ConnectivityService {
                             info.getExtraInfo());
                 }
                 intent.putExtra(ConnectivityManager.EXTRA_OTHER_NETWORK_INFO,
-                        getNetworkInfo(myDefaultNet));
+                        mNetTrackers[myDefaultNet].getNetworkInfo());
                 intent.putExtra(ConnectivityManager.EXTRA_INET_CONDITION,
                                 mDefaultInetConditionPublished);
 

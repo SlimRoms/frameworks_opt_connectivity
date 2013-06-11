@@ -19,7 +19,6 @@
 
 package com.android.server;
 
-import static android.Manifest.permission.CONNECTIVITY_INTERNAL;
 import static android.Manifest.permission.MANAGE_NETWORK_POLICY;
 import static android.Manifest.permission.RECEIVE_DATA_ACTIVITY_CHANGE;
 import static android.net.ConnectivityManager.CONNECTIVITY_ACTION;
@@ -35,13 +34,6 @@ import static android.net.ConnectivityManager.isNetworkTypeValid;
 import static android.net.NetworkPolicyManager.RULE_ALLOW_ALL;
 import static android.net.NetworkPolicyManager.RULE_REJECT_METERED;
 
-//import static com.quicinc.cne.CNE.EVENT_UPDATE_BLOCKED_UID;
-//import static com.quicinc.cne.CNE.EVENT_REPRIORITIZE_DNS;
-//import static com.quicinc.cne.CNE.EVENT_CONNECTIVITY_SWITCH;
-//import static com.quicinc.cne.CNE.CONNECTIVITY_AVAILABLE;
-//import static com.quicinc.cne.CNE.EXTRA_NETWORK_TYPE;
-
-import android.app.Activity;
 import android.bluetooth.BluetoothTetheringDataTracker;
 import android.content.BroadcastReceiver;
 import android.content.ContentResolver;
@@ -85,6 +77,7 @@ import android.os.IBinder;
 import android.os.INetworkManagementService;
 import android.os.Looper;
 import android.os.Message;
+import android.os.Messenger;
 import android.os.ParcelFileDescriptor;
 import android.os.PowerManager;
 import android.os.Process;
@@ -97,15 +90,14 @@ import android.provider.Settings;
 import android.security.Credentials;
 import android.security.KeyStore;
 import android.text.TextUtils;
-import android.util.EventLog;
 import android.util.Slog;
 import android.util.SparseIntArray;
 
 import com.android.internal.net.LegacyVpnInfo;
 import com.android.internal.net.VpnConfig;
 import com.android.internal.net.VpnProfile;
-import com.android.internal.telephony.PhoneConstants;
 import com.android.internal.telephony.Phone;
+import com.android.internal.telephony.PhoneConstants;
 import com.android.internal.util.IndentingPrintWriter;
 import com.android.internal.util.StateMachine;
 import com.android.internal.util.IState;
@@ -113,6 +105,7 @@ import com.android.internal.util.State;
 import com.android.server.AlarmManagerService;
 import com.android.server.am.BatteryStatsService;
 import com.android.server.ConnectivityService;
+import com.android.server.connectivity.Nat464Xlat;
 import com.android.server.connectivity.Tethering;
 import com.android.server.connectivity.Vpn;
 import com.android.server.net.BaseNetworkObserver;
@@ -120,9 +113,9 @@ import com.android.server.net.LockdownVpnTracker;
 import com.android.server.power.PowerManagerService;
 import com.google.android.collect.Lists;
 import com.google.android.collect.Sets;
-//import com.quicinc.cne.CNE;
 
 import dalvik.system.DexClassLoader;
+import dalvik.system.PathClassLoader;
 
 import java.io.FileDescriptor;
 import java.io.IOException;
@@ -144,10 +137,6 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
-
-import dalvik.system.PathClassLoader;
-import java.lang.reflect.Constructor;
-import java.lang.reflect.InvocationTargetException;
 
 
 /**
@@ -198,6 +187,8 @@ public class QcConnectivityService extends ConnectivityService {
     private boolean mLockdownEnabled;
     private LockdownVpnTracker mLockdownTracker;
 
+    private Nat464Xlat mClat;
+
     /** Lock around {@link #mUidRules} and {@link #mMeteredIfaces}. */
     private Object mRulesLock = new Object();
     /** Currently active network rules by UID. */
@@ -224,7 +215,7 @@ public class QcConnectivityService extends ConnectivityService {
      * A per Net list of the PID's that requested access to the net
      * used both as a refcount and for per-PID DNS selection
      */
-    private List mNetRequestersPids[];
+    private List<Integer> mNetRequestersPids[];
 
     // priority order of the nettrackers
     // (excluding dynamically set mNetworkPreference)
@@ -367,12 +358,11 @@ public class QcConnectivityService extends ConnectivityService {
 
     // track the current default http proxy - tell the world if we get a new one (real change)
     private ProxyProperties mDefaultProxy = null;
-    private Object mDefaultProxyLock = new Object();
+    private Object mProxyLock = new Object();
     private boolean mDefaultProxyDisabled = false;
 
     // track the global proxy.
     private ProxyProperties mGlobalProxy = null;
-    private final Object mGlobalProxyLock = new Object();
 
     private SettingsObserver mSettingsObserver;
 
@@ -525,8 +515,6 @@ public class QcConnectivityService extends ConnectivityService {
                 ConnectivityManager.MAX_NETWORK_TYPE+1];
         mCurrentLinkProperties = new LinkProperties[ConnectivityManager.MAX_NETWORK_TYPE+1];
 
-        mNetworkPreference = getPersistedNetworkPreference();
-
         mRadioAttributes = new RadioAttributes[ConnectivityManager.MAX_RADIO_TYPE+1];
         mNetConfigs = new NetworkConfig[ConnectivityManager.MAX_NETWORK_TYPE+1];
 
@@ -547,6 +535,9 @@ public class QcConnectivityService extends ConnectivityService {
             mRadioAttributes[r.mType] = r;
         }
 
+        // TODO: What is the "correct" way to do determine if this is a wifi only device?
+        boolean wifiOnly = SystemProperties.getBoolean("ro.radio.noril", false);
+        log("wifiOnly=" + wifiOnly);
         String[] naStrings = context.getResources().getStringArray(
                 com.android.internal.R.array.networkAttributes);
         for (String naString : naStrings) {
@@ -554,6 +545,11 @@ public class QcConnectivityService extends ConnectivityService {
                 NetworkConfig n = new NetworkConfig(naString);
                 if (n.type > ConnectivityManager.MAX_NETWORK_TYPE) {
                     loge("Error in networkAttributes - ignoring attempt to define type " +
+                            n.type);
+                    continue;
+                }
+                if (wifiOnly && ConnectivityManager.isNetworkTypeMobile(n.type)) {
+                    log("networkAttributes - ignoring mobile as this dev is wifiOnly " +
                             n.type);
                     continue;
                 }
@@ -608,14 +604,28 @@ public class QcConnectivityService extends ConnectivityService {
             }
         }
 
-        mNetRequestersPids = new ArrayList[ConnectivityManager.MAX_NETWORK_TYPE+1];
+        // Update mNetworkPreference according to user mannually first then overlay config.xml
+        mNetworkPreference = getPersistedNetworkPreference();
+        if (mNetworkPreference == -1) {
+            for (int n : mPriorityList) {
+                if (mNetConfigs[n].isDefault() && ConnectivityManager.isNetworkTypeValid(n)) {
+                    mNetworkPreference = n;
+                    break;
+                }
+            }
+            if (mNetworkPreference == -1) {
+                throw new IllegalStateException(
+                        "You should set at least one default Network in config.xml!");
+            }
+        }
+
+        mNetRequestersPids =
+                (List<Integer> [])new ArrayList[ConnectivityManager.MAX_NETWORK_TYPE+1];
         for (int i : mPriorityList) {
-            mNetRequestersPids[i] = new ArrayList();
+            mNetRequestersPids[i] = new ArrayList<Integer>();
         }
 
         mFeatureUsers = new ArrayList<FeatureUser>();
-
-        mNumDnsEntries = 0;
 
         mTestMode = SystemProperties.get("cm.test.mode").equals("true")
                 && SystemProperties.get("ro.build.type").equals("eng");
@@ -645,12 +655,15 @@ public class QcConnectivityService extends ConnectivityService {
                                   mTethering.getTetherableBluetoothRegexs().length != 0) &&
                                  mTethering.getUpstreamIfaceTypes().length != 0);
 
-        mVpn = new Vpn(mContext, mVpnCallback, mNetd);
+        mVpn = new Vpn(mContext, mVpnCallback, mNetd, this);
         mVpn.startMonitoring(mContext, mHandler);
+
+        mClat = new Nat464Xlat(mContext, mNetd, this, mHandler);
 
         try {
             mNetd.registerObserver(mTethering);
             mNetd.registerObserver(mDataActivityObserver);
+            mNetd.registerObserver(mClat);
         } catch (RemoteException e) {
             loge("Error registering observer :" + e);
         }
@@ -794,6 +807,7 @@ public class QcConnectivityService extends ConnectivityService {
      * Sets the preferred network.
      * @param preference the new preference
      */
+    @Override
     public void setNetworkPreference(int preference) {
         enforceChangePermission();
 
@@ -801,6 +815,7 @@ public class QcConnectivityService extends ConnectivityService {
                 mHandler.obtainMessage(EVENT_SET_NETWORK_PREFERENCE, preference, 0));
     }
 
+    @Override
     public int getNetworkPreference() {
         enforceAccessPermission();
         int preference;
@@ -841,11 +856,8 @@ public class QcConnectivityService extends ConnectivityService {
 
         final int networkPrefSetting = Settings.Global
                 .getInt(cr, Settings.Global.NETWORK_PREFERENCE, -1);
-        if (networkPrefSetting != -1) {
-            return networkPrefSetting;
-        }
 
-        return ConnectivityManager.DEFAULT_NETWORK_PREFERENCE;
+        return networkPrefSetting;
     }
 
     /**
@@ -942,6 +954,7 @@ public class QcConnectivityService extends ConnectivityService {
         return getNetworkInfo(mActiveDefaultNetwork, uid);
     }
 
+    @Override
     public NetworkInfo getActiveNetworkInfoUnfiltered() {
         enforceAccessPermission();
         if (isNetworkTypeValid(mActiveDefaultNetwork)) {
@@ -1092,6 +1105,7 @@ public class QcConnectivityService extends ConnectivityService {
         return false;
     }
 
+    @Override
     public boolean setRadios(boolean turnOn) {
         boolean result = true;
         enforceChangePermission();
@@ -1101,6 +1115,7 @@ public class QcConnectivityService extends ConnectivityService {
         return result;
     }
 
+    @Override
     public boolean setRadio(int netType, boolean turnOn) {
         enforceChangePermission();
         if (!ConnectivityManager.isNetworkTypeValid(netType)) {
@@ -1190,6 +1205,7 @@ public class QcConnectivityService extends ConnectivityService {
     }
 
     // javadoc from interface
+    @Override
     public int startUsingNetworkFeature(int networkType, String feature,
             IBinder binder) {
         long startTime = 0;
@@ -1303,8 +1319,11 @@ public class QcConnectivityService extends ConnectivityService {
                         log("startUsingNetworkFeature reconnecting to " + networkType + ": " +
                                 feature);
                     }
-                    network.reconnect();
-                    return PhoneConstants.APN_REQUEST_STARTED;
+                    if (network.reconnect()) {
+                        return PhoneConstants.APN_REQUEST_STARTED;
+                    } else {
+                        return PhoneConstants.APN_REQUEST_FAILED;
+                    }
                 } else {
                     // need to remember this unsupported request so we respond appropriately on stop
                     synchronized(this) {
@@ -1331,6 +1350,7 @@ public class QcConnectivityService extends ConnectivityService {
     }
 
     // javadoc from interface
+    @Override
     public int stopUsingNetworkFeature(int networkType, String feature) {
         enforceChangePermission();
 
@@ -1423,7 +1443,14 @@ public class QcConnectivityService extends ConnectivityService {
             if (usedNetworkType != networkType) {
                 Integer currentPid = new Integer(pid);
                 mNetRequestersPids[usedNetworkType].remove(currentPid);
-                reassessPidDns(pid, true);
+
+                final long token = Binder.clearCallingIdentity();
+                try {
+                    reassessPidDns(pid, true);
+                } finally {
+                    Binder.restoreCallingIdentity(token);
+                }
+                flushVmDnsCache();
                 if (mNetRequestersPids[usedNetworkType].size() != 0) {
                     if (VDBG) {
                         log("stopUsingNetworkFeature: net " + networkType + ": " + feature +
@@ -1481,6 +1508,7 @@ public class QcConnectivityService extends ConnectivityService {
      * desired
      * @return {@code true} on success, {@code false} on failure
      */
+    @Override
     public boolean requestRouteToHostAddress(int networkType, byte[] hostAddress) {
         enforceChangePermission();
         if (mProtectedNetworks.contains(networkType)) {
@@ -1517,11 +1545,11 @@ public class QcConnectivityService extends ConnectivityService {
     }
 
     private boolean addRoute(LinkProperties p, RouteInfo r, boolean toDefaultTable) {
-        return modifyRoute(p.getInterfaceName(), p, r, 0, ADD, toDefaultTable);
+        return modifyRoute(p, r, 0, ADD, toDefaultTable);
     }
 
     private boolean removeRoute(LinkProperties p, RouteInfo r, boolean toDefaultTable) {
-        return modifyRoute(p.getInterfaceName(), p, r, 0, REMOVE, toDefaultTable);
+        return modifyRoute(p, r, 0, REMOVE, toDefaultTable);
     }
 
     private boolean addRouteToAddress(LinkProperties lp, InetAddress addr) {
@@ -1534,26 +1562,27 @@ public class QcConnectivityService extends ConnectivityService {
 
     private boolean modifyRouteToAddress(LinkProperties lp, InetAddress addr, boolean doAdd,
             boolean toDefaultTable) {
-        RouteInfo bestRoute = RouteInfo.selectBestRoute(lp.getRoutes(), addr);
+        RouteInfo bestRoute = RouteInfo.selectBestRoute(lp.getAllRoutes(), addr);
         if (bestRoute == null) {
-            bestRoute = RouteInfo.makeHostRoute(addr);
+            bestRoute = RouteInfo.makeHostRoute(addr, lp.getInterfaceName());
         } else {
+            String iface = bestRoute.getInterface();
             if (bestRoute.getGateway().equals(addr)) {
                 // if there is no better route, add the implied hostroute for our gateway
-                bestRoute = RouteInfo.makeHostRoute(addr);
+                bestRoute = RouteInfo.makeHostRoute(addr, iface);
             } else {
                 // if we will connect to this through another route, add a direct route
                 // to it's gateway
-                bestRoute = RouteInfo.makeHostRoute(addr, bestRoute.getGateway());
+                bestRoute = RouteInfo.makeHostRoute(addr, bestRoute.getGateway(), iface);
             }
         }
-        return modifyRoute(lp.getInterfaceName(), lp, bestRoute, 0, doAdd, toDefaultTable);
+        return modifyRoute(lp, bestRoute, 0, doAdd, toDefaultTable);
     }
 
-    private boolean modifyRoute(String ifaceName, LinkProperties lp, RouteInfo r, int cycleCount,
-            boolean doAdd, boolean toDefaultTable) {
-        if ((ifaceName == null) || (lp == null) || (r == null)) {
-            if (DBG) log("modifyRoute got unexpected null: " + ifaceName + ", " + lp + ", " + r);
+    private boolean modifyRoute(LinkProperties lp, RouteInfo r, int cycleCount, boolean doAdd,
+            boolean toDefaultTable) {
+        if ((lp == null) || (r == null)) {
+            if (DBG) log("modifyRoute got unexpected null: " + lp + ", " + r);
             return false;
         }
 
@@ -1562,18 +1591,25 @@ public class QcConnectivityService extends ConnectivityService {
             return false;
         }
 
-        if (r.isHostRoute() == false) {
-            RouteInfo bestRoute = RouteInfo.selectBestRoute(lp.getRoutes(), r.getGateway());
+        String ifaceName = r.getInterface();
+        if(ifaceName == null) {
+            loge("Error modifying route - no interface name");
+            return false;
+        }
+        if (r.hasGateway()) {
+            RouteInfo bestRoute = RouteInfo.selectBestRoute(lp.getAllRoutes(), r.getGateway());
             if (bestRoute != null) {
                 if (bestRoute.getGateway().equals(r.getGateway())) {
                     // if there is no better route, add the implied hostroute for our gateway
-                    bestRoute = RouteInfo.makeHostRoute(r.getGateway());
+                    bestRoute = RouteInfo.makeHostRoute(r.getGateway(), ifaceName);
                 } else {
                     // if we will connect to our gateway through another route, add a direct
                     // route to it's gateway
-                    bestRoute = RouteInfo.makeHostRoute(r.getGateway(), bestRoute.getGateway());
+                    bestRoute = RouteInfo.makeHostRoute(r.getGateway(),
+                                                        bestRoute.getGateway(),
+                                                        ifaceName);
                 }
-                modifyRoute(ifaceName, lp, bestRoute, cycleCount+1, doAdd, toDefaultTable);
+                modifyRoute(lp, bestRoute, cycleCount+1, doAdd, toDefaultTable);
             }
         }
         if (doAdd) {
@@ -1624,6 +1660,7 @@ public class QcConnectivityService extends ConnectivityService {
     /**
      * @see ConnectivityManager#getMobileDataEnabled()
      */
+    @Override
     public boolean getMobileDataEnabled() {
         // TODO: This detail should probably be in DataConnectionTracker's
         //       which is where we store the value and maybe make this
@@ -1635,6 +1672,7 @@ public class QcConnectivityService extends ConnectivityService {
         return retVal;
     }
 
+    @Override
     public void setDataDependency(int networkType, boolean met) {
         enforceConnectivityInternalPermission();
 
@@ -1710,6 +1748,7 @@ public class QcConnectivityService extends ConnectivityService {
     /**
      * @see ConnectivityManager#setMobileDataEnabled(boolean)
      */
+    @Override
     public void setMobileDataEnabled(boolean enabled) {
         enforceChangePermission();
         if (DBG) log("setMobileDataEnabled(" + enabled + ")");
@@ -1728,7 +1767,7 @@ public class QcConnectivityService extends ConnectivityService {
         if (mNetTrackers[ConnectivityManager.TYPE_WIMAX] != null) {
             if (VDBG) {
                 log(mNetTrackers[ConnectivityManager.TYPE_WIMAX].toString() + enabled);
-        }
+            }
             mNetTrackers[ConnectivityManager.TYPE_WIMAX].setUserDataEnable(enabled);
         }
     }
@@ -1740,7 +1779,7 @@ public class QcConnectivityService extends ConnectivityService {
 
         mHandler.sendMessage(mHandler.obtainMessage(
                 EVENT_SET_POLICY_DATA_ENABLE, networkType, (enabled ? ENABLED : DISABLED)));
-        }
+    }
 
     private void handleSetPolicyDataEnable(int networkType, boolean enabled) {
         if (isNetworkTypeValid(networkType)) {
@@ -1798,16 +1837,15 @@ public class QcConnectivityService extends ConnectivityService {
         // Remove idletimer previously setup in {@code handleConnect}
         removeDataActivityTracking(prevNetType);
 
-    /*
+        /*
          * If the disconnected network is not the active one, then don't report
          * this as a loss of connectivity. What probably happened is that we're
          * getting the disconnect for a network that we explicitly disabled
          * in accordance with network preference policies.
          */
         if (!mNetConfigs[prevNetType].isDefault()) {
-            List pids = mNetRequestersPids[prevNetType];
-            for (int i = 0; i<pids.size(); i++) {
-                Integer pid = (Integer)pids.get(i);
+            List<Integer> pids = mNetRequestersPids[prevNetType];
+            for (Integer pid : pids) {
                 // will remove them because the net's no longer connected
                 // need to do this now as only now do we know the pids and
                 // can properly null things that are no longer referenced.
@@ -1927,7 +1965,9 @@ public class QcConnectivityService extends ConnectivityService {
         }
     }
 
+    @Override
     public void sendConnectedBroadcast(NetworkInfo info) {
+        enforceConnectivityInternalPermission();
         sendGeneralBroadcast(info, CONNECTIVITY_ACTION_IMMEDIATE);
         sendGeneralBroadcast(info, CONNECTIVITY_ACTION);
     }
@@ -2078,6 +2118,7 @@ public class QcConnectivityService extends ConnectivityService {
         }
     }
 
+    @Override
     public void systemReady() {
         synchronized(this) {
             mSystemReady = true;
@@ -2211,7 +2252,9 @@ public class QcConnectivityService extends ConnectivityService {
     }
 
     /** @hide */
+    @Override
     public void captivePortalCheckComplete(NetworkInfo info) {
+        enforceConnectivityInternalPermission();
         mNetTrackers[info.getType()].captivePortalCheckComplete();
     }
 
@@ -2267,87 +2310,86 @@ public class QcConnectivityService extends ConnectivityService {
         }
     }
 
-        /**
-         * After a change in the connectivity state of a network. We're mainly
-         * concerned with making sure that the list of DNS servers is set up
-         * according to which networks are connected, and ensuring that the
-         * right routing table entries exist.
+    /**
+     * After a change in the connectivity state of a network. We're mainly
+     * concerned with making sure that the list of DNS servers is set up
+     * according to which networks are connected, and ensuring that the
+     * right routing table entries exist.
+     */
+    private void handleConnectivityChange(int netType, boolean doReset) {
+        int resetMask = doReset ? NetworkUtils.RESET_ALL_ADDRESSES : 0;
+
+        /*
+         * If a non-default network is enabled, add the host routes that
+         * will allow it's DNS servers to be accessed.
          */
-        private void handleConnectivityChange(int netType, boolean doReset) {
-            int resetMask = doReset ? NetworkUtils.RESET_ALL_ADDRESSES : 0;
+        handleDnsConfigurationChange(netType);
 
-            /*
-             * If a non-default network is enabled, add the host routes that
-             * will allow it's DNS servers to be accessed.
-             */
-            handleDnsConfigurationChange(netType);
+        LinkProperties curLp = mCurrentLinkProperties[netType];
+        LinkProperties newLp = null;
 
-            LinkProperties curLp = mCurrentLinkProperties[netType];
-            LinkProperties newLp = null;
+        if (mNetTrackers[netType].getNetworkInfo().isConnected()) {
+            newLp = mNetTrackers[netType].getLinkProperties();
+            if (VDBG) {
+                log("handleConnectivityChange: changed linkProperty[" + netType + "]:" +
+                        " doReset=" + doReset + " resetMask=" + resetMask +
+                        "\n   curLp=" + curLp +
+                        "\n   newLp=" + newLp);
+            }
 
-            if (mNetTrackers[netType].getNetworkInfo().isConnected()) {
-                newLp = mNetTrackers[netType].getLinkProperties();
-                if (VDBG) {
-                    log("handleConnectivityChange: changed linkProperty[" + netType + "]:" +
-                            " doReset=" + doReset + " resetMask=" + resetMask +
-                            "\n   curLp=" + curLp +
-                            "\n   newLp=" + newLp);
-                }
-
-                if (curLp != null) {
-                    if (curLp.isIdenticalInterfaceName(newLp)) {
-                        CompareResult<LinkAddress> car = curLp.compareAddresses(newLp);
-                        if ((car.removed.size() != 0) || (car.added.size() != 0)) {
-                            for (LinkAddress linkAddr : car.removed) {
-                                if (linkAddr.getAddress() instanceof Inet4Address) {
-                                    resetMask |= NetworkUtils.RESET_IPV4_ADDRESSES;
-                                }
-                                if (linkAddr.getAddress() instanceof Inet6Address) {
-                                    resetMask |= NetworkUtils.RESET_IPV6_ADDRESSES;
-                                }
+            if (curLp != null) {
+                if (curLp.isIdenticalInterfaceName(newLp)) {
+                    CompareResult<LinkAddress> car = curLp.compareAddresses(newLp);
+                    if ((car.removed.size() != 0) || (car.added.size() != 0)) {
+                        for (LinkAddress linkAddr : car.removed) {
+                            if (linkAddr.getAddress() instanceof Inet4Address) {
+                                resetMask |= NetworkUtils.RESET_IPV4_ADDRESSES;
                             }
-                            if (DBG) {
-                                log("handleConnectivityChange: addresses changed" +
-                                        " linkProperty[" + netType + "]:" + " resetMask=" + resetMask +
-                                        "\n   car=" + car);
+                            if (linkAddr.getAddress() instanceof Inet6Address) {
+                                resetMask |= NetworkUtils.RESET_IPV6_ADDRESSES;
                             }
-                        } else {
-                            if (DBG) {
-                                log("handleConnectivityChange: address are the same reset per doReset" +
-                                       " linkProperty[" + netType + "]:" +
-                                       " resetMask=" + resetMask);
-                            }
+                        }
+                        if (DBG) {
+                            log("handleConnectivityChange: addresses changed" +
+                                    " linkProperty[" + netType + "]:" + " resetMask=" + resetMask +
+                                    "\n   car=" + car);
                         }
                     } else {
-                        resetMask = NetworkUtils.RESET_ALL_ADDRESSES;
                         if (DBG) {
-                            log("handleConnectivityChange: interface not not equivalent reset both" +
-                                    " linkProperty[" + netType + "]:" +
-                                    " resetMask=" + resetMask);
+                            log("handleConnectivityChange: address are the same reset per doReset" +
+                                   " linkProperty[" + netType + "]:" +
+                                   " resetMask=" + resetMask);
                         }
                     }
-                }
-                if (mNetConfigs[netType].isDefault()) {
-                    handleApplyDefaultProxy(newLp.getHttpProxy());
-                }
-            } else {
-                if (VDBG) {
-                    log("handleConnectivityChange: changed linkProperty[" + netType + "]:" +
-                            " doReset=" + doReset + " resetMask=" + resetMask +
-                            "\n  curLp=" + curLp +
-                            "\n  newLp= null");
+                } else {
+                    resetMask = NetworkUtils.RESET_ALL_ADDRESSES;
+                    if (DBG) {
+                        log("handleConnectivityChange: interface not not equivalent reset both" +
+                                " linkProperty[" + netType + "]:" +
+                                " resetMask=" + resetMask);
+                    }
                 }
             }
-            mCurrentLinkProperties[netType] = newLp;
+            if (mNetConfigs[netType].isDefault()) {
+                handleApplyDefaultProxy(newLp.getHttpProxy());
+            }
+        } else {
+            if (VDBG) {
+                log("handleConnectivityChange: changed linkProperty[" + netType + "]:" +
+                        " doReset=" + doReset + " resetMask=" + resetMask +
+                        "\n  curLp=" + curLp +
+                        "\n  newLp= null");
+            }
+        }
+        mCurrentLinkProperties[netType] = newLp;
             boolean resetDns = updateRoutes( newLp,
                                              curLp,
                                              mNetConfigs[netType].isDefault(),
                                              mRouteAttributes[netType] );
 
-            if (resetMask != 0 || resetDns) {
-                LinkProperties linkProperties = mNetTrackers[netType].getLinkProperties();
-                if (linkProperties != null) {
-                    String iface = linkProperties.getInterfaceName();
+        if (resetMask != 0 || resetDns) {
+            if (curLp != null) {
+                for (String iface : curLp.getAllInterfaceNames()) {
                     if (TextUtils.isEmpty(iface) == false) {
                         if (resetMask != 0) {
                             if (DBG) log("resetConnections(" + iface + ", " + resetMask + ")");
@@ -2360,6 +2402,7 @@ public class QcConnectivityService extends ConnectivityService {
                             }
                         }
                         if (resetDns) {
+                            flushVmDnsCache();
                             if (VDBG) log("resetting DNS cache for " + iface);
                             try {
                                 mNetd.flushInterfaceDnsCache(iface);
@@ -2368,143 +2411,165 @@ public class QcConnectivityService extends ConnectivityService {
                                 if (DBG) loge("Exception resetting dns cache: " + e);
                             }
                         }
+                    } else {
+                        loge("Can't reset connection for type "+netType);
                     }
-                }
-            }
-
-            // TODO: Temporary notifying upstread change to Tethering.
-            //       @see bug/4455071
-            /** Notify TetheringService if interface name has been changed. */
-            if (TextUtils.equals(mNetTrackers[netType].getNetworkInfo().getReason(),
-                                 PhoneConstants.REASON_LINK_PROPERTIES_CHANGED)) {
-                if (isTetheringSupported()) {
-                    mTethering.handleTetherIfaceChange(mNetTrackers[netType].getNetworkInfo());
                 }
             }
         }
 
-        /**
-         * Add and remove routes using the old properties (null if not previously connected),
-         * new properties (null if becoming disconnected).  May even be double null, which
-         * is a noop.
-         * Uses isLinkDefault to determine if default routes should be set or conversely if
-         * host routes should be set to the dns servers
-         * returns a boolean indicating the routes changed
-         */
-        private boolean updateRoutes(LinkProperties newLp, LinkProperties curLp,
-                boolean isLinkDefault, RouteAttributes ra) {
-            Collection<RouteInfo> routesToAdd = null;
-            CompareResult<InetAddress> dnsDiff = new CompareResult<InetAddress>();
-            CompareResult<RouteInfo> routeDiff = new CompareResult<RouteInfo>();
-            CompareResult<LinkAddress> localAddrDiff = new CompareResult<LinkAddress>();
-            if (curLp != null) {
-                // check for the delta between the current set and the new
-                routeDiff = curLp.compareRoutes(newLp);
-                dnsDiff = curLp.compareDnses(newLp);
-                localAddrDiff = curLp.compareAddresses(newLp);
-            } else if (newLp != null) {
-                routeDiff.added = newLp.getRoutes();
-                dnsDiff.added = newLp.getDnses();
-                localAddrDiff.added = newLp.getLinkAddresses();
+        // Update 464xlat state.
+        NetworkStateTracker tracker = mNetTrackers[netType];
+        if (mClat.requiresClat(netType, tracker)) {
+            // If the connection was previously using clat, but is not using it now, stop the clat
+            // daemon. Normally, this happens automatically when the connection disconnects, but if
+            // the disconnect is not reported, or if the connection's LinkProperties changed for
+            // some other reason (e.g., handoff changes the IP addresses on the link), it would
+            // still be running. If it's not running, then stopping it is a no-op.
+            if (Nat464Xlat.isRunningClat(curLp) && !Nat464Xlat.isRunningClat(newLp)) {
+                mClat.stopClat();
             }
-
-            boolean routesChanged = (routeDiff.removed.size() != 0 || routeDiff.added.size() != 0);
-
-            for (RouteInfo r : routeDiff.removed) {
-                if (isLinkDefault || ! r.isDefaultRoute()) {
-                    removeRoute(curLp, r, TO_DEFAULT_TABLE);
-                }
-                if (isLinkDefault == false) {
-                    // remove from a secondary route table
-                    removeRoute(curLp, r, TO_SECONDARY_TABLE);
-                }
-            }
-
-            for (RouteInfo r :  routeDiff.added) {
-                if (isLinkDefault || ! r.isDefaultRoute()) {
-                    addRoute(newLp, r, TO_DEFAULT_TABLE);
-                } else {
-                    // add to a secondary route table
-                    addRoute(newLp, r, TO_SECONDARY_TABLE);
-
-                    // many radios add a default route even when we don't want one.
-                    // remove the default route unless somebody else has asked for it
-                    String ifaceName = newLp.getInterfaceName();
-                    if (TextUtils.isEmpty(ifaceName) == false && mAddedRoutes.contains(r) == false) {
-                        if (VDBG) log("Removing " + r + " for interface " + ifaceName);
-                        try {
-                            mNetd.removeRoute(ifaceName, r);
-                        } catch (Exception e) {
-                            // never crash - catch them all
-                            if (DBG) loge("Exception trying to remove a route: " + e);
-                        }
-                    }
-                }
-            }
-
-            if (localAddrDiff.removed.size() != 0) {
-                for (LinkAddress la : localAddrDiff.removed) {
-                    if (VDBG) log("Removing src route for:" + la.getAddress().getHostAddress());
-                    try {
-                         mNetd.delSrcRoute(la.getAddress().getAddress(), ra.getTableId());
-                    } catch (Exception e) {
-                        loge("Exception while trying to remove src route: " + e);
-                    }
-                }
-            }
-
-            if (localAddrDiff.added.size() != 0) {
-                InetAddress gw4Addr = null, gw6Addr = null;
-                String ifaceName = newLp.getInterfaceName();
-                if (! TextUtils.isEmpty(ifaceName)) {
-                    for (RouteInfo r : newLp.getRoutes()) {
-                        if (! r.isDefaultRoute()) continue;
-                        if (r.getGateway() instanceof Inet4Address)
-                            gw4Addr = r.getGateway();
-                        else
-                            gw6Addr = r.getGateway();
-                    } //gateway is optional so continue adding the source route.
-                    for (LinkAddress la : localAddrDiff.added) {
-                        try {
-                            if (la.getAddress() instanceof Inet4Address) {
-                                mNetd.replaceSrcRoute(ifaceName, la.getAddress().getAddress(),
-                                        gw4Addr.getAddress(), ra.getTableId());
-                            } else {
-                                mNetd.replaceSrcRoute(ifaceName, la.getAddress().getAddress(),
-                                        gw6Addr.getAddress(), ra.getTableId());
-                            }
-                        } catch (Exception e) {
-                            //never crash, catch them all
-                            loge("Exception while trying to add src route: " + e);
-                        }
-                    }
-                }
-            }
-
-            // handle DNS routes for all net types - no harm done
-            if (routesChanged) {
-                // routes changed - remove all old dns entries and add new
-                if (curLp != null) {
-                    for (InetAddress oldDns : curLp.getDnses()) {
-                        removeRouteToAddress(curLp, oldDns);
-                    }
-                }
-                if (newLp != null) {
-                    for (InetAddress newDns : newLp.getDnses()) {
-                        addRouteToAddress(newLp, newDns);
-                    }
-                }
+            // If the link requires clat to be running, then start the daemon now.
+            if (mNetTrackers[netType].getNetworkInfo().isConnected()) {
+                mClat.startClat(tracker);
             } else {
-                // no change in routes, check for change in dns themselves
-                for (InetAddress oldDns : dnsDiff.removed) {
+                mClat.stopClat();
+            }
+        }
+
+        // TODO: Temporary notifying upstread change to Tethering.
+        //       @see bug/4455071
+        /** Notify TetheringService if interface name has been changed. */
+        if (TextUtils.equals(mNetTrackers[netType].getNetworkInfo().getReason(),
+                             PhoneConstants.REASON_LINK_PROPERTIES_CHANGED)) {
+            if (isTetheringSupported()) {
+                mTethering.handleTetherIfaceChange();
+            }
+        }
+    }
+
+    /**
+     * Add and remove routes using the old properties (null if not previously connected),
+     * new properties (null if becoming disconnected).  May even be double null, which
+     * is a noop.
+     * Uses isLinkDefault to determine if default routes should be set. Adds host routes
+     * to the dns servers for all networks. Adds source policy routes for all networks.
+     * Returns a boolean indicating the routes changed
+     */
+    private boolean updateRoutes(LinkProperties newLp, LinkProperties curLp,
+                boolean isLinkDefault, RouteAttributes ra) {
+        Collection<RouteInfo> routesToAdd = null;
+        CompareResult<InetAddress> dnsDiff = new CompareResult<InetAddress>();
+        CompareResult<RouteInfo> routeDiff = new CompareResult<RouteInfo>();
+        CompareResult<LinkAddress> localAddrDiff = new CompareResult<LinkAddress>();
+        if (curLp != null) {
+            // check for the delta between the current set and the new
+            routeDiff = curLp.compareRoutes(newLp);
+            dnsDiff = curLp.compareDnses(newLp);
+                localAddrDiff = curLp.compareAddresses(newLp);
+        } else if (newLp != null) {
+            routeDiff.added = newLp.getAllRoutes();
+            dnsDiff.added = newLp.getDnses();
+            localAddrDiff.added = newLp.getLinkAddresses();
+        }
+
+        boolean routesChanged = (routeDiff.removed.size() != 0 || routeDiff.added.size() != 0);
+
+        for (RouteInfo r : routeDiff.removed) {
+            if (isLinkDefault || ! r.isDefaultRoute()) {
+                removeRoute(curLp, r, TO_DEFAULT_TABLE);
+            }
+            if (isLinkDefault == false) {
+                // remove from a secondary route table
+                removeRoute(curLp, r, TO_SECONDARY_TABLE);
+            }
+        }
+
+        // handle DNS routes for all net types - no harm done
+        if (routesChanged) {
+            // routes changed - remove all old dns entries and add new
+            if (curLp != null) {
+                for (InetAddress oldDns : curLp.getDnses()) {
                     removeRouteToAddress(curLp, oldDns);
                 }
-                for (InetAddress newDns : dnsDiff.added) {
+            }
+            if (newLp != null) {
+                for (InetAddress newDns : newLp.getDnses()) {
                     addRouteToAddress(newLp, newDns);
                 }
             }
-            return routesChanged;
+        } else {
+            // no change in routes, check for change in dns themselves
+            for (InetAddress oldDns : dnsDiff.removed) {
+                removeRouteToAddress(curLp, oldDns);
+            }
+            for (InetAddress newDns : dnsDiff.added) {
+                addRouteToAddress(newLp, newDns);
+            }
         }
+
+        for (RouteInfo r :  routeDiff.added) {
+            if (isLinkDefault || ! r.isDefaultRoute()) {
+                addRoute(newLp, r, TO_DEFAULT_TABLE);
+            } else {
+                // add to a secondary route table
+                addRoute(newLp, r, TO_SECONDARY_TABLE);
+
+                // many radios add a default route even when we don't want one.
+                // remove the default route unless somebody else has asked for it
+                String ifaceName = newLp.getInterfaceName();
+                if (TextUtils.isEmpty(ifaceName) == false && mAddedRoutes.contains(r) == false) {
+                    if (VDBG) log("Removing " + r + " for interface " + ifaceName);
+                    try {
+                        mNetd.removeRoute(ifaceName, r);
+                    } catch (Exception e) {
+                        // never crash - catch them all
+                        if (DBG) loge("Exception trying to remove a route: " + e);
+                    }
+                }
+            }
+        }
+
+        if (localAddrDiff.removed.size() != 0) {
+            for (LinkAddress la : localAddrDiff.removed) {
+                if (VDBG) log("Removing src route for:" + la.getAddress().getHostAddress());
+                try {
+                     mNetd.delSrcRoute(la.getAddress().getAddress(), ra.getTableId());
+                } catch (Exception e) {
+                    loge("Exception while trying to remove src route: " + e);
+                }
+            }
+        }
+
+        if (localAddrDiff.added.size() != 0) {
+            InetAddress gw4Addr = null, gw6Addr = null;
+            String ifaceName = newLp.getInterfaceName();
+            if (! TextUtils.isEmpty(ifaceName)) {
+                for (RouteInfo r : newLp.getRoutes()) {
+                    if (! r.isDefaultRoute()) continue;
+                    if (r.getGateway() instanceof Inet4Address)
+                        gw4Addr = r.getGateway();
+                    else
+                        gw6Addr = r.getGateway();
+                } //gateway is optional so continue adding the source route.
+                for (LinkAddress la : localAddrDiff.added) {
+                    try {
+                        if (la.getAddress() instanceof Inet4Address) {
+                            mNetd.replaceSrcRoute(ifaceName, la.getAddress().getAddress(),
+                                    gw4Addr.getAddress(), ra.getTableId());
+                        } else {
+                            mNetd.replaceSrcRoute(ifaceName, la.getAddress().getAddress(),
+                                    gw6Addr.getAddress(), ra.getTableId());
+                        }
+                    } catch (Exception e) {
+                        //never crash, catch them all
+                        loge("Exception while trying to add src route: " + e);
+                    }
+                }
+            }
+        }
+        return routesChanged;
+    }
 
 
    /**
@@ -2512,7 +2577,7 @@ public class QcConnectivityService extends ConnectivityService {
      * net.tcp.buffersize.[default|wifi|umts|edge|gprs] and set them for system
      * wide use
      */
-   public void updateNetworkSettings(NetworkStateTracker nt) {
+   private void updateNetworkSettings(NetworkStateTracker nt) {
         String key = nt.getTcpBufferSizesPropName();
         String bufferSizes = key == null ? null : SystemProperties.get(key);
 
@@ -2566,9 +2631,10 @@ public class QcConnectivityService extends ConnectivityService {
      * on the highest priority active net which this process requested.
      * If there aren't any, clear it out
      */
-    private void reassessPidDns(int myPid, boolean doBump)
+    private void reassessPidDns(int pid, boolean doBump)
     {
-        if (VDBG) log("reassessPidDns for pid " + myPid);
+        if (VDBG) log("reassessPidDns for pid " + pid);
+        Integer myPid = new Integer(pid);
         for(int i : mPriorityList) {
             if (mNetConfigs[i].isDefault()) {
                 continue;
@@ -2578,61 +2644,25 @@ public class QcConnectivityService extends ConnectivityService {
                     !nt.isTeardownRequested()) {
                 LinkProperties p = nt.getLinkProperties();
                 if (p == null) continue;
-                List pids = mNetRequestersPids[i];
-                for (int j=0; j<pids.size(); j++) {
-                    Integer pid = (Integer)pids.get(j);
-                    if (pid.intValue() == myPid) {
-                        Collection<InetAddress> dnses = p.getDnses();
-                        writePidDns(dnses, myPid);
-                        if (doBump) {
-                            bumpDns();
-                        }
-                        return;
+                if (mNetRequestersPids[i].contains(myPid)) {
+                    try {
+                        mNetd.setDnsInterfaceForPid(p.getInterfaceName(), pid);
+                    } catch (Exception e) {
+                        Slog.e(TAG, "exception reasseses pid dns: " + e);
                     }
+                    return;
                 }
            }
         }
         // nothing found - delete
-        for (int i = 1; ; i++) {
-            String prop = "net.dns" + i + "." + myPid;
-            if (SystemProperties.get(prop).length() == 0) {
-                if (doBump) {
-                    bumpDns();
-                }
-                return;
-            }
-            SystemProperties.set(prop, "");
+        try {
+            mNetd.clearDnsInterfaceForPid(pid);
+        } catch (Exception e) {
+            Slog.e(TAG, "exception clear interface from pid: " + e);
         }
     }
 
-    // return true if results in a change
-    private boolean writePidDns(Collection <InetAddress> dnses, int pid) {
-        int j = 1;
-        boolean changed = false;
-        for (InetAddress dns : dnses) {
-            String dnsString = dns.getHostAddress();
-            if (changed || !dnsString.equals(SystemProperties.get("net.dns" + j + "." + pid))) {
-                changed = true;
-                SystemProperties.set("net.dns" + j + "." + pid, dns.getHostAddress());
-            }
-            j++;
-        }
-        return changed;
-    }
-
-    private void bumpDns() {
-        /*
-         * Bump the property that tells the name resolver library to reread
-         * the DNS server list from the properties.
-         */
-        String propVal = SystemProperties.get("net.dnschange");
-        int n = 0;
-        if (propVal.length() != 0) {
-            try {
-                n = Integer.parseInt(propVal);
-            } catch (NumberFormatException e) {}
-        }
-        SystemProperties.set("net.dnschange", "" + (n+1));
+    private void flushVmDnsCache() {
         /*
          * Tell the VMs to toss their DNS caches
          */
@@ -2651,56 +2681,34 @@ public class QcConnectivityService extends ConnectivityService {
     }
 
     // Caller must grab mDnsLock.
-    private boolean updateDns(String network, String iface,
+    private void updateDnsLocked(String network, String iface,
             Collection<InetAddress> dnses, String domains) {
-        boolean changed = false;
         int last = 0;
         if (dnses.size() == 0 && mDefaultDns != null) {
-            ++last;
-            String value = mDefaultDns.getHostAddress();
-            if (!value.equals(SystemProperties.get("net.dns1"))) {
-                if (DBG) {
-                    loge("no dns provided for " + network + " - using " + value);
-                }
-                changed = true;
-                SystemProperties.set("net.dns1", value);
+            dnses = new ArrayList();
+            dnses.add(mDefaultDns);
+            if (DBG) {
+                loge("no dns provided for " + network + " - using " + mDefaultDns.getHostAddress());
             }
-        } else {
+        }
+
+        try {
+            mNetd.setDnsServersForInterface(iface, NetworkUtils.makeStrings(dnses), domains);
+            mNetd.setDefaultInterfaceForDns(iface);
             for (InetAddress dns : dnses) {
                 ++last;
                 String key = "net.dns" + last;
                 String value = dns.getHostAddress();
-                if (!changed && value.equals(SystemProperties.get(key))) {
-                    continue;
-                }
-                if (VDBG) {
-                    log("adding dns " + value + " for " + network);
-                }
-                changed = true;
                 SystemProperties.set(key, value);
             }
-        }
-        for (int i = last + 1; i <= mNumDnsEntries; ++i) {
-            String key = "net.dns" + i;
-            if (VDBG) log("erasing " + key);
-            changed = true;
-            SystemProperties.set(key, "");
-        }
-        mNumDnsEntries = last;
-
-        if (changed) {
-            try {
-                mNetd.setDnsServersForInterface(iface, NetworkUtils.makeStrings(dnses));
-                mNetd.setDefaultInterfaceForDns(iface);
-            } catch (Exception e) {
-                if (DBG) loge("exception setting default dns interface: " + e);
+            for (int i = last + 1; i <= mNumDnsEntries; ++i) {
+                String key = "net.dns" + i;
+                SystemProperties.set(key, "");
             }
+            mNumDnsEntries = last;
+        } catch (Exception e) {
+            if (DBG) loge("exception setting default dns interface: " + e);
         }
-        if (!domains.equals(SystemProperties.get("net.dns.search"))) {
-            SystemProperties.set("net.dns.search", domains);
-            changed = true;
-        }
-        return changed;
     }
 
     private void handleDnsConfigurationChange(int netType) {
@@ -2710,33 +2718,31 @@ public class QcConnectivityService extends ConnectivityService {
             LinkProperties p = nt.getLinkProperties();
             if (p == null) return;
             Collection<InetAddress> dnses = p.getDnses();
-            boolean changed = false;
             if (mNetConfigs[netType].isDefault()) {
                 String network = nt.getNetworkInfo().getTypeName();
                 synchronized (mDnsLock) {
                     if (!mDnsOverridden) {
-                        String domain = "";
-                        if (TextUtils.isEmpty (p.getDomainName ()) == false) {
-                            domain = p.getDomainName ();
-                        }
-                        changed = updateDns(network, p.getInterfaceName(), dnses, domain);
+                        updateDnsLocked(network, p.getInterfaceName(), dnses, p.getDomains());
                     }
                 }
             } else {
                 try {
                     mNetd.setDnsServersForInterface(p.getInterfaceName(),
-                            NetworkUtils.makeStrings(dnses));
+                            NetworkUtils.makeStrings(dnses), p.getDomains());
                 } catch (Exception e) {
                     if (DBG) loge("exception setting dns servers: " + e);
                 }
                 // set per-pid dns for attached secondary nets
-                List pids = mNetRequestersPids[netType];
-                for (int y=0; y< pids.size(); y++) {
-                    Integer pid = (Integer)pids.get(y);
-                    changed = writePidDns(dnses, pid.intValue());
+                List<Integer> pids = mNetRequestersPids[netType];
+                for (Integer pid : pids) {
+                    try {
+                        mNetd.setDnsInterfaceForPid(p.getInterfaceName(), pid);
+                    } catch (Exception e) {
+                        Slog.e(TAG, "exception setting interface for pid: " + e);
+                    }
                 }
             }
-            if (changed) bumpDns();
+            flushVmDnsCache();
         }
     }
 
@@ -2795,7 +2801,7 @@ public class QcConnectivityService extends ConnectivityService {
         pw.increaseIndent();
         for (int net : mPriorityList) {
             String pidString = net + ": ";
-            for (Object pid : mNetRequestersPids[net]) {
+            for (Integer pid : mNetRequestersPids[net]) {
                 pidString = pidString + pid.toString() + ", ";
             }
             pw.println(pidString);
@@ -2989,165 +2995,154 @@ public class QcConnectivityService extends ConnectivityService {
             @Override
             public void exit() {
                 if (DBG) log( "ConnectivityServiceHSM leaving " + getCurrentState().getName());
-            }
+        }
 
-            @Override
-            public boolean processMessage(Message msg) {
-
+        @Override
+        public boolean processMessage(Message msg) {
                 if (DBG) log("Actual State: DefaultConnectivityState, Current State: " +
                         getCurrentState().getName() + ".processMessage what=" + msg.what);
 
-                NetworkInfo info;
-                switch (msg.what) {
-                    case NetworkStateTracker.EVENT_STATE_CHANGED:
-                    {
-                        info = (NetworkInfo) msg.obj;
-                        int type = info.getType();
-                        NetworkInfo.State state = info.getState();
+            NetworkInfo info;
+            switch (msg.what) {
+                case NetworkStateTracker.EVENT_STATE_CHANGED:
+                {
+                    info = (NetworkInfo) msg.obj;
+                    int type = info.getType();
+                    NetworkInfo.State state = info.getState();
 
-                        if (VDBG || (state == NetworkInfo.State.CONNECTED) ||
-                                (state == NetworkInfo.State.DISCONNECTED)) {
-                            log("ConnectivityChange for " +
-                                info.getTypeName() + ": " +
-                                state + "/" + info.getDetailedState());
-                        }
+                    if (VDBG || (state == NetworkInfo.State.CONNECTED) ||
+                            (state == NetworkInfo.State.DISCONNECTED)) {
+                        log("ConnectivityChange for " +
+                            info.getTypeName() + ": " +
+                            state + "/" + info.getDetailedState());
+                    }
 
-                        // Connectivity state changed:
-                        // [31-13] Reserved for future use
-                        // [12-9] Network subtype (for mobile network, as defined
-                        //         by TelephonyManager)
-                        // [8-3] Detailed state ordinal (as defined by
-                        //         NetworkInfo.DetailedState)
-                        // [2-0] Network type (as defined by ConnectivityManager)
-                        int eventLogParam = (info.getType() & 0x7) |
-                                ((info.getDetailedState().ordinal() & 0x3f) << 3) |
-                                (info.getSubtype() << 9);
-                        EventLog.writeEvent(EventLogTags.CONNECTIVITY_STATE_CHANGED,
-                                eventLogParam);
+                    EventLogTags.writeConnectivityStateChanged(
+                            info.getType(), info.getSubtype(), info.getDetailedState().ordinal());
 
-                        if (info.getDetailedState() ==
-                                NetworkInfo.DetailedState.FAILED) {
-                            sendMessageAtFrontOfQueue(HSM_HANDLE_CONNECTION_FAILURE, info);
-                        } else if (info.getDetailedState() ==
-                                DetailedState.CAPTIVE_PORTAL_CHECK) {
-                            sendMessageAtFrontOfQueue(HSM_HANDLE_CAPTIVE_PORTAL_CHECK, info);
-                        } else if (state == NetworkInfo.State.DISCONNECTED) {
-                            sendMessageAtFrontOfQueue(HSM_HANDLE_DISCONNECT, info);
-                        } else if (state == NetworkInfo.State.SUSPENDED) {
-                            // TODO: need to think this over.
-                            // the logic here is, handle SUSPENDED the same as
-                            // DISCONNECTED. The only difference being we are
-                            // broadcasting an intent with NetworkInfo that's
-                            // suspended. This allows the applications an
-                            // opportunity to handle DISCONNECTED and SUSPENDED
-                            // differently, or not.
-                            sendMessageAtFrontOfQueue(HSM_HANDLE_DISCONNECT, info);
-                        } else if (state == NetworkInfo.State.CONNECTED) {
-                            sendMessageAtFrontOfQueue(HSM_HANDLE_CONNECT, info);
-                        }
-                        if (mLockdownTracker != null) {
-                            mLockdownTracker.onNetworkInfoChanged(info);
-                        }
-                        break;
+                    if (info.getDetailedState() ==
+                            NetworkInfo.DetailedState.FAILED) {
+                        sendMessageAtFrontOfQueue(HSM_HANDLE_CONNECTION_FAILURE, info);
+                    } else if (info.getDetailedState() ==
+                            DetailedState.CAPTIVE_PORTAL_CHECK) {
+                        sendMessageAtFrontOfQueue(HSM_HANDLE_CAPTIVE_PORTAL_CHECK, info);
+                    } else if (state == NetworkInfo.State.DISCONNECTED) {
+                        sendMessageAtFrontOfQueue(HSM_HANDLE_DISCONNECT, info);
+                    } else if (state == NetworkInfo.State.SUSPENDED) {
+                        // TODO: need to think this over.
+                        // the logic here is, handle SUSPENDED the same as
+                        // DISCONNECTED. The only difference being we are
+                        // broadcasting an intent with NetworkInfo that's
+                        // suspended. This allows the applications an
+                        // opportunity to handle DISCONNECTED and SUSPENDED
+                        // differently, or not.
+                        sendMessageAtFrontOfQueue(HSM_HANDLE_DISCONNECT, info);
+                    } else if (state == NetworkInfo.State.CONNECTED) {
+                        sendMessageAtFrontOfQueue(HSM_HANDLE_CONNECT, info);
                     }
-                    case NetworkStateTracker.EVENT_CONFIGURATION_CHANGED:
-                    {
-                        info = (NetworkInfo) msg.obj;
-                        // TODO: Temporary allowing network configuration
-                        //       change not resetting sockets.
-                        //       @see bug/4455071
-                        sendMessageAtFrontOfQueue(obtainMessage(
-                                    HSM_HANDLE_CONNECTIVITY_CHANGE,
-                                    info.getType(), 0));
-                        break;
+                    if (mLockdownTracker != null) {
+                        mLockdownTracker.onNetworkInfoChanged(info);
                     }
-                    case NetworkStateTracker.EVENT_NETWORK_SUBTYPE_CHANGED:
-                    {
-                        info = (NetworkInfo) msg.obj;
-                        updateNetworkSettings(mNetTrackers[info.getType()]);
-                        break;
+                    break;
                     }
-                    case EVENT_CLEAR_NET_TRANSITION_WAKELOCK:
-                    {
-                        String causedBy = null;
+                case NetworkStateTracker.EVENT_CONFIGURATION_CHANGED:
+                {
+                    info = (NetworkInfo) msg.obj;
+                    // TODO: Temporary allowing network configuration
+                    //       change not resetting sockets.
+                    //       @see bug/4455071
+                    sendMessageAtFrontOfQueue(obtainMessage(
+                                HSM_HANDLE_CONNECTIVITY_CHANGE,
+                                info.getType(), 0));
+                    break;
+                }
+                case NetworkStateTracker.EVENT_NETWORK_SUBTYPE_CHANGED:
+                {
+                    info = (NetworkInfo) msg.obj;
+                    updateNetworkSettings(mNetTrackers[info.getType()]);
+                    break;
+                }
+                case EVENT_CLEAR_NET_TRANSITION_WAKELOCK:
+                {
+                    String causedBy = null;
                         synchronized (QcConnectivityService.this) {
-                            if (msg.arg1 == mNetTransitionWakeLockSerialNumber &&
-                                    mNetTransitionWakeLock.isHeld()) {
-                                mNetTransitionWakeLock.release();
-                                causedBy = mNetTransitionWakeLockCausedBy;
-                            }
+                        if (msg.arg1 == mNetTransitionWakeLockSerialNumber &&
+                                mNetTransitionWakeLock.isHeld()) {
+                            mNetTransitionWakeLock.release();
+                            causedBy = mNetTransitionWakeLockCausedBy;
                         }
-                        if (causedBy != null) {
-                            log("NetTransition Wakelock for " + causedBy + " released by timeout");
-                        }
-                        break;
                     }
-                    case EVENT_RESTORE_DEFAULT_NETWORK:
-                    {
-                        FeatureUser u = (FeatureUser)msg.obj;
-                        u.expire();
-                        break;
+                    if (causedBy != null) {
+                        log("NetTransition Wakelock for " + causedBy + " released by timeout");
                     }
-                    case EVENT_INET_CONDITION_CHANGE:
-                    {
-                        sendMessageAtFrontOfQueue(obtainMessage(
-                                    HSM_HANDLE_INET_CONDITION_CHANGE, msg.arg1, msg.arg2));
-                        break;
+                    break;
+                }
+                case EVENT_RESTORE_DEFAULT_NETWORK:
+                {
+                    FeatureUser u = (FeatureUser)msg.obj;
+                    u.expire();
+                    break;
+                }
+                case EVENT_INET_CONDITION_CHANGE:
+                {
+                    sendMessageAtFrontOfQueue(obtainMessage(
+                                HSM_HANDLE_INET_CONDITION_CHANGE, msg.arg1, msg.arg2));
+                    break;
+                }
+                case EVENT_INET_CONDITION_HOLD_END:
+                {
+                    sendMessageAtFrontOfQueue(obtainMessage(
+                            HSM_HANDLE_INET_CONDITION_HOLD_END, msg.arg1, msg.arg2));
+                    break;
+                }
+                case EVENT_SET_NETWORK_PREFERENCE:
+                {
+                    int preference = msg.arg1;
+                    handleSetNetworkPreference(preference);
+                    break;
+                }
+                case EVENT_SET_MOBILE_DATA:
+                {
+                    boolean enabled = (msg.arg1 == ENABLED);
+                    handleSetMobileData(enabled);
+                    break;
+                }
+                case EVENT_APPLY_GLOBAL_HTTP_PROXY:
+                {
+                    handleDeprecatedGlobalHttpProxy();
+                    break;
+                }
+                case EVENT_SET_DEPENDENCY_MET:
+                {
+                    boolean met = (msg.arg1 == ENABLED);
+                    handleSetDependencyMet(msg.arg2, met);
+                    break;
+                }
+                case EVENT_RESTORE_DNS:
+                {
+                    sendMessageAtFrontOfQueue(HSM_EVENT_RESTORE_DNS);
+                    break;
+                }
+                case EVENT_SEND_STICKY_BROADCAST_INTENT:
+                {
+                    Intent intent = (Intent)msg.obj;
+                    sendStickyBroadcast(intent);
+                    break;
+                }
+                case EVENT_SET_POLICY_DATA_ENABLE:
+                {
+                    final int networkType = msg.arg1;
+                    final boolean enabled = msg.arg2 == ENABLED;
+                    handleSetPolicyDataEnable(networkType, enabled);
+                    break;
+                }
+                case EVENT_VPN_STATE_CHANGED:
+                {
+                    if (mLockdownTracker != null) {
+                        mLockdownTracker.onVpnStateChanged((NetworkInfo) msg.obj);
                     }
-                    case EVENT_INET_CONDITION_HOLD_END:
-                    {
-                        sendMessageAtFrontOfQueue(obtainMessage(
-                                HSM_HANDLE_INET_CONDITION_HOLD_END, msg.arg1, msg.arg2));
-                        break;
-                    }
-                    case EVENT_SET_NETWORK_PREFERENCE:
-                    {
-                        int preference = msg.arg1;
-                        handleSetNetworkPreference(preference);
-                        break;
-                    }
-                    case EVENT_SET_MOBILE_DATA:
-                    {
-                        boolean enabled = (msg.arg1 == ENABLED);
-                        handleSetMobileData(enabled);
-                        break;
-                    }
-                    case EVENT_APPLY_GLOBAL_HTTP_PROXY:
-                    {
-                        handleDeprecatedGlobalHttpProxy();
-                        break;
-                    }
-                    case EVENT_SET_DEPENDENCY_MET:
-                    {
-                        boolean met = (msg.arg1 == ENABLED);
-                        handleSetDependencyMet(msg.arg2, met);
-                        break;
-                    }
-                    case EVENT_RESTORE_DNS:
-                    {
-                        sendMessageAtFrontOfQueue(HSM_EVENT_RESTORE_DNS);
-                        break;
-                    }
-                    case EVENT_SEND_STICKY_BROADCAST_INTENT:
-                    {
-                        Intent intent = (Intent)msg.obj;
-                        sendStickyBroadcast(intent);
-                        break;
-                    }
-                    case EVENT_SET_POLICY_DATA_ENABLE:
-                    {
-                        final int networkType = msg.arg1;
-                        final boolean enabled = msg.arg2 == ENABLED;
-                        handleSetPolicyDataEnable(networkType, enabled);
-                        break;
-                    }
-                    case EVENT_VPN_STATE_CHANGED:
-                    {
-                        if (mLockdownTracker != null) {
-                            mLockdownTracker.onVpnStateChanged((NetworkInfo) msg.obj);
-                        }
-                        break;
-                    }
+                    break;
+                }
                     case EVENT_UPDATE_BLOCKED_UID:
                     {
                         handleUpdateBlockedUids(msg.arg1, (msg.arg2 == 1));
@@ -3639,6 +3634,12 @@ public class QcConnectivityService extends ConnectivityService {
                     mVpn.interfaceStatusChanged(
                             mNetTrackers[otherDefaultNet].getLinkProperties().getInterfaceName(),
                             false);
+                    /**
+                    * moved this logic from orig handleConnectivityChange to here, to allow only one
+                    * default http proxy at any given time.
+                    */
+                    QcConnectivityService.this.handleApplyDefaultProxy(
+                        mNetTrackers[myDefaultNet].getLinkProperties().getHttpProxy());
                     sendConnectivitySwitchBroadcast(reason);
                 } else {
                     //pre switch handling in old state
@@ -3654,7 +3655,8 @@ public class QcConnectivityService extends ConnectivityService {
              * priority.
              * Caller must grab mDnsLock
              */
-            private boolean updateDns(String iface, Collection<InetAddress> netDnses) {
+            private void updateDnsLocked(String iface,
+                                         Collection<InetAddress> netDnses, String domains) {
 
                 if (DBG) log(getCurrentState().getName() + " updateDns");
                 boolean changed = false;
@@ -3674,29 +3676,22 @@ public class QcConnectivityService extends ConnectivityService {
                 }
 
                 if (dnses.size() == 0 && mDefaultDns != null) {
+                    dnses.add(mDefaultDns);
+                    if (DBG) {
+                        loge("no dns provided - using " + mDefaultDns.getHostAddress());
+                    }
+                    changed = true;
+                }
+                for (InetAddress dns : dnses) {
                     ++last;
-                    String value = mDefaultDns.getHostAddress();
-                    if (!value.equals(SystemProperties.get("net.dns1"))) {
-                        if (DBG) {
-                            loge("no dns provided - using " + value);
-                        }
-                        changed = true;
-                        SystemProperties.set("net.dns1", value);
+                    String key = "net.dns" + last;
+                    String value = dns.getHostAddress();
+                    if (!changed && value.equals(SystemProperties.get(key))) {
+                        continue;
                     }
-                } else {
-                    for (InetAddress dns : dnses) {
-                        ++last;
-                        String key = "net.dns" + last;
-                        String value = dns.getHostAddress();
-                        if (!changed && value.equals(SystemProperties.get(key))) {
-                            continue;
-                        }
-                        if (VDBG) {
-                            log("adding dns " + value );
-                        }
-                        changed = true;
-                        SystemProperties.set(key, value);
-                    }
+                    if (VDBG) log("adding dns " + value );
+                    changed = true;
+                    SystemProperties.set(key, value);
                 }
                 for (int i = last + 1; i <= mNumDnsEntries; ++i) {
                     String key = "net.dns" + i;
@@ -3711,7 +3706,7 @@ public class QcConnectivityService extends ConnectivityService {
                         if (iface != null && netDnses != null) {
                             // only update interface dns cache for the changed iface.
                             mNetd.setDnsServersForInterface( iface,
-                                    NetworkUtils.makeStrings(netDnses) );
+                                    NetworkUtils.makeStrings(netDnses), domains );
                         }
                         // set appropriate default iface for dns cache
                         String defDnsIface = null;
@@ -3727,7 +3722,6 @@ public class QcConnectivityService extends ConnectivityService {
                         if (VDBG) loge("exception setting default dns interface: " + e);
                     }
                 }
-                return changed;
             }
 
             /**
@@ -3747,47 +3741,48 @@ public class QcConnectivityService extends ConnectivityService {
                 synchronized (mDnsLock) {
                     myDefaultDnsNet = netType;
                     if (!mDnsOverridden) {
-                        if (updateDns(null, null)) bumpDns();
+                        updateDnsLocked(null, null, null);
                     }
                 }
+                flushVmDnsCache();
             }
 
             /**
              * Same as default state's implementation, with exception of calling
-             * custom updateDns method.
+             * custom updateDnsLocked() method.
              */
             protected void handleDnsConfigurationChange(int netType) {
-
-                if (DBG) log(getCurrentState().getName() + " handleDnsConfigurationChange");
                 // add default net's dns entries
                 NetworkStateTracker nt = mNetTrackers[netType];
                 if (nt != null && nt.getNetworkInfo().isConnected() && !nt.isTeardownRequested()) {
                     LinkProperties p = nt.getLinkProperties();
                     if (p == null) return;
                     Collection<InetAddress> dnses = p.getDnses();
-                    boolean changed = false;
                     if (mNetConfigs[netType].isDefault()) {
                         String network = nt.getNetworkInfo().getTypeName();
                         synchronized (mDnsLock) {
                             if (!mDnsOverridden) {
-                                changed = updateDns(p.getInterfaceName(), dnses);
+                                updateDnsLocked(p.getInterfaceName(), dnses, p.getDomains());
                             }
                         }
                     } else {
                         try {
                             mNetd.setDnsServersForInterface(p.getInterfaceName(),
-                                    NetworkUtils.makeStrings(dnses));
+                                    NetworkUtils.makeStrings(dnses), p.getDomains());
                         } catch (Exception e) {
-                            if (VDBG) loge("exception setting dns servers: " + e);
+                            if (DBG) loge("exception setting dns servers: " + e);
                         }
                         // set per-pid dns for attached secondary nets
-                        List pids = mNetRequestersPids[netType];
-                        for (int y=0; y< pids.size(); y++) {
-                            Integer pid = (Integer)pids.get(y);
-                            changed = writePidDns(dnses, pid.intValue());
+                        List<Integer> pids = mNetRequestersPids[netType];
+                        for (Integer pid : pids) {
+                            try {
+                                mNetd.setDnsInterfaceForPid(p.getInterfaceName(), pid);
+                            } catch (Exception e) {
+                                Slog.e(TAG, "exception setting interface for pid: " + e);
+                            }
                         }
                     }
-                    if (changed) bumpDns();
+                    flushVmDnsCache();
                 }
             }
 
@@ -4068,11 +4063,11 @@ public class QcConnectivityService extends ConnectivityService {
                 sendInetConditionBroadcast(networkInfo);
                 return true;
             }
-
             /**
              * Smart Connectivity networks handleConnectivityChange method.
              * Pretty much the same as default state's method barring exception
-             * that it calls a private update route method.
+             * that it calls a private update route method and does not set http
+             * proxy.
              * -------------------------------
              * After a change in the connectivity state of a network. We're mainly
              * concerned with making sure that the list of DNS servers is set up
@@ -4080,19 +4075,19 @@ public class QcConnectivityService extends ConnectivityService {
              * right routing table entries exist.
              */
             private void handleConnectivityChange(int netType, boolean doReset) {
-
-                if (DBG) log(getCurrentState().getName() + " handleConnectivityChange");
                 int resetMask = doReset ? NetworkUtils.RESET_ALL_ADDRESSES : 0;
-                 //If a non-default network is enabled, add the host routes that
-                 //will allow it's DNS servers to be accessed.
-                handleDnsConfigurationChange(netType); // use custom handler
+
+                /*
+                 * If a non-default network is enabled, add the host routes that
+                 * will allow it's DNS servers to be accessed.
+                 */
+                handleDnsConfigurationChange(netType); //use custom handler
 
                 LinkProperties curLp = mCurrentLinkProperties[netType];
                 LinkProperties newLp = null;
 
                 if (mNetTrackers[netType].getNetworkInfo().isConnected()) {
                     newLp = mNetTrackers[netType].getLinkProperties();
-
                     if (VDBG) {
                         log("handleConnectivityChange: changed linkProperty[" + netType + "]:" +
                                 " doReset=" + doReset + " resetMask=" + resetMask +
@@ -4114,26 +4109,24 @@ public class QcConnectivityService extends ConnectivityService {
                                 }
                                 if (DBG) {
                                     log("handleConnectivityChange: addresses changed" +
-                                            " linkProperty[" + netType + "]:" +
-                                            " resetMask=" + resetMask + "\n   car=" + car);
+                                            " linkProperty[" + netType + "]:" + " resetMask=" + resetMask +
+                                            "\n   car=" + car);
                                 }
                             } else {
                                 if (DBG) {
-                                    log("handleConnectivityChange: address are the " +
-                                            " same reset per doReset linkProperty[" +
-                                            netType + "]: resetMask=" + resetMask);
+                                    log("handleConnectivityChange: address are the same reset per doReset" +
+                                           " linkProperty[" + netType + "]:" +
+                                           " resetMask=" + resetMask);
                                 }
                             }
                         } else {
                             resetMask = NetworkUtils.RESET_ALL_ADDRESSES;
                             if (DBG) {
-                                log("handleConnectivityChange: interface not equivalent reset both"+
-                                        " linkProperty[" + netType + "]: resetMask=" + resetMask);
+                                log("handleConnectivityChange: interface not not equivalent reset both" +
+                                        " linkProperty[" + netType + "]:" +
+                                        " resetMask=" + resetMask);
                             }
                         }
-                    }
-                    if (mNetConfigs[netType].isDefault()) {
-                        handleApplyDefaultProxy(newLp.getHttpProxy());
                     }
                 } else {
                     if (VDBG) {
@@ -4144,36 +4137,58 @@ public class QcConnectivityService extends ConnectivityService {
                     }
                 }
                 mCurrentLinkProperties[netType] = newLp;
-                boolean resetDns = updateRoutes( newLp,
-                                                 curLp,
-                                                 mNetConfigs[netType].isDefault(),
-                                                 mRouteAttributes[netType] );
+                    boolean resetDns = updateRoutes( newLp,
+                                                     curLp,
+                                                     mNetConfigs[netType].isDefault(),
+                                                     mRouteAttributes[netType] );
 
                 if (resetMask != 0 || resetDns) {
-                    LinkProperties linkProperties = mNetTrackers[netType].getLinkProperties();
-                    if (linkProperties != null) {
-                        String iface = linkProperties.getInterfaceName();
-                        if (TextUtils.isEmpty(iface) == false) {
-                            if (resetMask != 0) {
-                                if (DBG) log("resetConnections(" + iface + ", " + resetMask + ")");
-                                NetworkUtils.resetConnections(iface, resetMask);
+                    if (curLp != null) {
+                        for (String iface : curLp.getAllInterfaceNames()) {
+                            if (TextUtils.isEmpty(iface) == false) {
+                                if (resetMask != 0) {
+                                    if (DBG) log("resetConnections(" + iface + ", " + resetMask + ")");
+                                    NetworkUtils.resetConnections(iface, resetMask);
 
-                                // Tell VPN the interface is down. It is a temporary
-                                // but effective fix to make VPN aware of the change.
-                                if ((resetMask & NetworkUtils.RESET_IPV4_ADDRESSES) != 0) {
-                                    mVpn.interfaceStatusChanged(iface, false);
+                                    // Tell VPN the interface is down. It is a temporary
+                                    // but effective fix to make VPN aware of the change.
+                                    if ((resetMask & NetworkUtils.RESET_IPV4_ADDRESSES) != 0) {
+                                        mVpn.interfaceStatusChanged(iface, false);
+                                    }
                                 }
-                            }
-                            if (resetDns) {
-                                if (VDBG) log("resetting DNS cache for " + iface);
-                                try {
-                                    mNetd.flushInterfaceDnsCache(iface);
-                                } catch (Exception e) {
-                                    // never crash - catch them all
-                                    if (DBG) loge("Exception resetting dns cache: " + e);
+                                if (resetDns) {
+                                    flushVmDnsCache();
+                                    if (VDBG) log("resetting DNS cache for " + iface);
+                                    try {
+                                        mNetd.flushInterfaceDnsCache(iface);
+                                    } catch (Exception e) {
+                                        // never crash - catch them all
+                                        if (DBG) loge("Exception resetting dns cache: " + e);
+                                    }
                                 }
+                            } else {
+                                loge("Can't reset connection for type "+netType);
                             }
                         }
+                    }
+                }
+
+                // Update 464xlat state.
+                NetworkStateTracker tracker = mNetTrackers[netType];
+                if (mClat.requiresClat(netType, tracker)) {
+                    // If the connection was previously using clat, but is not using it now, stop the clat
+                    // daemon. Normally, this happens automatically when the connection disconnects, but if
+                    // the disconnect is not reported, or if the connection's LinkProperties changed for
+                    // some other reason (e.g., handoff changes the IP addresses on the link), it would
+                    // still be running. If it's not running, then stopping it is a no-op.
+                    if (Nat464Xlat.isRunningClat(curLp) && !Nat464Xlat.isRunningClat(newLp)) {
+                        mClat.stopClat();
+                    }
+                    // If the link requires clat to be running, then start the daemon now.
+                    if (mNetTrackers[netType].getNetworkInfo().isConnected()) {
+                        mClat.startClat(tracker);
+                    } else {
+                        mClat.stopClat();
                     }
                 }
 
@@ -4183,7 +4198,7 @@ public class QcConnectivityService extends ConnectivityService {
                 if (TextUtils.equals(mNetTrackers[netType].getNetworkInfo().getReason(),
                                      PhoneConstants.REASON_LINK_PROPERTIES_CHANGED)) {
                     if (isTetheringSupported()) {
-                        mTethering.handleTetherIfaceChange(mNetTrackers[netType].getNetworkInfo());
+                        mTethering.handleTetherIfaceChange();
                     }
                 }
             }
@@ -4218,7 +4233,7 @@ public class QcConnectivityService extends ConnectivityService {
                         if (p == null ) continue;
                         for (RouteInfo r : p.getRoutes()) {
                             if (r != null && r.isDefaultRoute()) {
-                                removeRoute(p, r, TO_DEFAULT_TABLE);
+                                QcConnectivityService.this.removeRoute(p, r, TO_DEFAULT_TABLE);
                             }
                         }
                     }
@@ -4228,7 +4243,7 @@ public class QcConnectivityService extends ConnectivityService {
                     if (p == null) return;
                     for (RouteInfo r : p.getRoutes()) {
                         if (r != null && r.isDefaultRoute()) {
-                            removeRoute(p, r, TO_DEFAULT_TABLE);
+                            QcConnectivityService.this.removeRoute(p, r, TO_DEFAULT_TABLE);
                         }
                     }
                 }
@@ -4244,12 +4259,8 @@ public class QcConnectivityService extends ConnectivityService {
                     int cycleCount, int defaultRouteMetric) {
 
                 if (DBG) log(getCurrentState().getName() + " addRoute");
-
-                int metric = 0;
-                String ifaceName = lp.getInterfaceName();
-
-                if ((ifaceName == null) || (lp == null) || (r == null)) {
-                    return false;
+                if (lp == null || r == null) {
+                    if (DBG) log("addRoute got unexpected null: " + lp + ", "+ r);
                 }
 
                 if (cycleCount > MAX_HOSTROUTE_CYCLE_COUNT) {
@@ -4257,20 +4268,29 @@ public class QcConnectivityService extends ConnectivityService {
                     return false;
                 }
 
-                if (r.isHostRoute() == false) {
-                    // use state specific metric for default routes
-                    metric = defaultRouteMetric;
+                int metric = 0;
+                String ifaceName = r.getInterface();
+                if (ifaceName == null) {
+                    loge("Error adding route - no interface name");
+                    return false;
+                }
+
+                // use state specific metric for default routes
+                if ( ! r.isHostRoute() )metric = defaultRouteMetric;
+                if (r.hasGateway()) {
                     RouteInfo bestRoute =
-                        RouteInfo.selectBestRoute(lp.getRoutes(), r.getGateway());
+                        RouteInfo.selectBestRoute(lp.getAllRoutes(), r.getGateway());
                     if (bestRoute != null) {
                         if (bestRoute.getGateway().equals(r.getGateway())) {
                             //if there is no better route, add the implied hostroute for our gateway
-                            bestRoute = RouteInfo.makeHostRoute(r.getGateway());
+                            bestRoute = RouteInfo.makeHostRoute(r.getGateway(), ifaceName);
                         } else {
                             // if we will connect to our gateway through another route, add a direct
                             // route to it's gateway
                             bestRoute =
-                                RouteInfo.makeHostRoute(r.getGateway(), bestRoute.getGateway());
+                                RouteInfo.makeHostRoute(r.getGateway(),
+                                                        bestRoute.getGateway(),
+                                                        ifaceName);
                         }
                         addRoute(lp, bestRoute, cycleCount+1, metric);
                     }
@@ -4298,15 +4318,12 @@ public class QcConnectivityService extends ConnectivityService {
              * Add and remove routes using the old properties (null if not previously connected),
              * new properties (null if becoming disconnected).  May even be double null, which
              * is a noop.
-             * updates dns routes for all networks.
-             * Uses private addRoute method to handle metrics for default routes in default table
-             * returns a boolean indicating the routes changed
+             * Uses isLinkDefault to determine if default routes should be set. Adds host routes
+             * to the dns servers for all networks. Adds source policy routes for all networks.
+             * Returns a boolean indicating the routes changed
              */
-            protected boolean updateRoutes(LinkProperties newLp,
-                    LinkProperties curLp, boolean isLinkDefault, RouteAttributes ra) {
-
-                if (DBG) log(getCurrentState().getName() + " updateRoutes");
-
+            protected boolean updateRoutes(LinkProperties newLp, LinkProperties curLp,
+                        boolean isLinkDefault, RouteAttributes ra) {
                 Collection<RouteInfo> routesToAdd = null;
                 CompareResult<InetAddress> dnsDiff = new CompareResult<InetAddress>();
                 CompareResult<RouteInfo> routeDiff = new CompareResult<RouteInfo>();
@@ -4315,27 +4332,49 @@ public class QcConnectivityService extends ConnectivityService {
                     // check for the delta between the current set and the new
                     routeDiff = curLp.compareRoutes(newLp);
                     dnsDiff = curLp.compareDnses(newLp);
-                    localAddrDiff = curLp.compareAddresses(newLp);
+                        localAddrDiff = curLp.compareAddresses(newLp);
                 } else if (newLp != null) {
-                    routeDiff.added = newLp.getRoutes();
+                    routeDiff.added = newLp.getAllRoutes();
                     dnsDiff.added = newLp.getDnses();
                     localAddrDiff.added = newLp.getLinkAddresses();
                 }
 
-                boolean routesChanged =
-                    (routeDiff.removed.size() != 0 || routeDiff.added.size() != 0);
+                boolean routesChanged = (routeDiff.removed.size() != 0 || routeDiff.added.size() != 0);
 
                 for (RouteInfo r : routeDiff.removed) {
                     if (isLinkDefault || ! r.isDefaultRoute()) {
-                        removeRoute(curLp, r, TO_DEFAULT_TABLE);
+                        QcConnectivityService.this.removeRoute(curLp, r, TO_DEFAULT_TABLE);
                     }
                     if (isLinkDefault == false) {
                         // remove from a secondary route table
-                        removeRoute(curLp, r, TO_SECONDARY_TABLE);
+                        QcConnectivityService.this.removeRoute(curLp, r, TO_SECONDARY_TABLE);
                     }
                 }
 
-                for (RouteInfo r : routeDiff.added) {
+                // handle DNS routes for all net types - no harm done
+                if (routesChanged) {
+                    // routes changed - remove all old dns entries and add new
+                    if (curLp != null) {
+                        for (InetAddress oldDns : curLp.getDnses()) {
+                            QcConnectivityService.this.removeRouteToAddress(curLp, oldDns);
+                        }
+                    }
+                    if (newLp != null) {
+                        for (InetAddress newDns : newLp.getDnses()) {
+                            QcConnectivityService.this.addRouteToAddress(newLp, newDns);
+                        }
+                    }
+                } else {
+                    // no change in routes, check for change in dns themselves
+                    for (InetAddress oldDns : dnsDiff.removed) {
+                        QcConnectivityService.this.removeRouteToAddress(curLp, oldDns);
+                    }
+                    for (InetAddress newDns : dnsDiff.added) {
+                        QcConnectivityService.this.addRouteToAddress(newLp, newDns);
+                    }
+                }
+
+                for (RouteInfo r :  routeDiff.added) {
                     if (isLinkDefault || ! r.isDefaultRoute()) {
                         // add to main table - uses custom addRoute with metric
                         addRoute(newLp, r, 0, ra.getMetric());
@@ -4346,13 +4385,13 @@ public class QcConnectivityService extends ConnectivityService {
                         // many radios add a default route even when we don't want one.
                         // remove the default route unless somebody else has asked for it
                         String ifaceName = newLp.getInterfaceName();
-                        if ( ! TextUtils.isEmpty(ifaceName) && ! mAddedRoutes.contains(r)) {
+                        if (TextUtils.isEmpty(ifaceName) == false && mAddedRoutes.contains(r) == false) {
                             if (VDBG) log("Removing " + r + " for interface " + ifaceName);
                             try {
                                 mNetd.removeRoute(ifaceName, r);
                             } catch (Exception e) {
                                 // never crash - catch them all
-                                if (VDBG) loge("Exception trying to remove a route: " + e);
+                                if (DBG) loge("Exception trying to remove a route: " + e);
                             }
                         }
                     }
@@ -4375,11 +4414,10 @@ public class QcConnectivityService extends ConnectivityService {
                     if (! TextUtils.isEmpty(ifaceName)) {
                         for (RouteInfo r : newLp.getRoutes()) {
                             if (! r.isDefaultRoute()) continue;
-                            if (r.getGateway() instanceof Inet4Address) {
+                            if (r.getGateway() instanceof Inet4Address)
                                 gw4Addr = r.getGateway();
-                            } else {
+                            else
                                 gw6Addr = r.getGateway();
-                            }
                         } //gateway is optional so continue adding the source route.
                         for (LinkAddress la : localAddrDiff.added) {
                             try {
@@ -4397,36 +4435,15 @@ public class QcConnectivityService extends ConnectivityService {
                         }
                     }
                 }
-
-                // handle DNS routes
-                if (routesChanged) {
-                    // routes changed - remove all old dns entries and add new
-                    if (curLp != null) {
-                        for (InetAddress oldDns : curLp.getDnses()) {
-                            removeRouteToAddress(curLp, oldDns);
-                        }
-                    }
-                    if (newLp != null) {
-                        for (InetAddress newDns : newLp.getDnses()) {
-                            addRouteToAddress(newLp, newDns);
-                        }
-                    }
-                } else {
-                    // no change in routes, check for change in dns themselves
-                    for (InetAddress oldDns : dnsDiff.removed) {
-                        removeRouteToAddress(curLp, oldDns);
-                    }
-                    for (InetAddress newDns : dnsDiff.added) {
-                        addRouteToAddress(newLp, newDns);
-                    }
-                }
                 return routesChanged;
             }
+
         } // end dualConnectivityState class
 
     } // end ConnectivityServiceHSM
 
     // javadoc from interface
+    @Override
     public int tether(String iface) {
         enforceTetherChangePermission();
 
@@ -4442,6 +4459,7 @@ public class QcConnectivityService extends ConnectivityService {
     }
 
     // javadoc from interface
+    @Override
     public int untether(String iface) {
         enforceTetherChangePermission();
 
@@ -4453,6 +4471,7 @@ public class QcConnectivityService extends ConnectivityService {
     }
 
     // javadoc from interface
+    @Override
     public int getLastTetherError(String iface) {
         enforceTetherAccessPermission();
 
@@ -4464,6 +4483,7 @@ public class QcConnectivityService extends ConnectivityService {
     }
 
     // TODO - proper iface API for selection by property, inspection, etc
+    @Override
     public String[] getTetherableUsbRegexs() {
         enforceTetherAccessPermission();
         if (isTetheringSupported()) {
@@ -4473,6 +4493,7 @@ public class QcConnectivityService extends ConnectivityService {
         }
     }
 
+    @Override
     public String[] getTetherableWifiRegexs() {
         enforceTetherAccessPermission();
         if (isTetheringSupported()) {
@@ -4482,6 +4503,7 @@ public class QcConnectivityService extends ConnectivityService {
         }
     }
 
+    @Override
     public String[] getTetherableBluetoothRegexs() {
         enforceTetherAccessPermission();
         if (isTetheringSupported()) {
@@ -4491,8 +4513,9 @@ public class QcConnectivityService extends ConnectivityService {
         }
     }
 
+    @Override
     public int setUsbTethering(boolean enable) {
-        enforceTetherAccessPermission();
+        enforceTetherChangePermission();
         if (isTetheringSupported()) {
             return mTethering.setUsbTethering(enable);
         } else {
@@ -4502,11 +4525,13 @@ public class QcConnectivityService extends ConnectivityService {
 
     // TODO - move iface listing, queries, etc to new module
     // javadoc from interface
+    @Override
     public String[] getTetherableIfaces() {
         enforceTetherAccessPermission();
         return mTethering.getTetherableIfaces();
     }
 
+    @Override
     public String[] getTetheredIfaces() {
         enforceTetherAccessPermission();
         return mTethering.getTetheredIfaces();
@@ -4518,6 +4543,7 @@ public class QcConnectivityService extends ConnectivityService {
         return mTethering.getTetheredIfacePairs();
     }
 
+    @Override
     public String[] getTetheringErroredIfaces() {
         enforceTetherAccessPermission();
         return mTethering.getErroredIfaces();
@@ -4526,6 +4552,7 @@ public class QcConnectivityService extends ConnectivityService {
     // if ro.tether.denied = true we default to no tethering
     // gservices could set the secure setting to 1 though to enable it on a build where it
     // had previously been turned off.
+    @Override
     public boolean isTetheringSupported() {
         enforceTetherAccessPermission();
         int defaultVal = (SystemProperties.get("ro.tether.denied").equals("true") ? 0 : 1);
@@ -4536,6 +4563,7 @@ public class QcConnectivityService extends ConnectivityService {
 
     // An API NetworkStateTrackers can call when they lose their network.
     // This will request the HSM to acquire NetTransition wakelock
+    @Override
     public void requestNetworkTransitionWakelock(String forWhom) {
         enforceConnectivityInternalPermission();
         synchronized (this) {
@@ -4547,6 +4575,7 @@ public class QcConnectivityService extends ConnectivityService {
     }
 
     // 100 percent is full good, 0 is full bad.
+    @Override
     public void reportInetCondition(int networkType, int percentage) {
         if (VDBG) log("reportNetworkCondition(" + networkType + ", " + percentage + ")");
         mContext.enforceCallingOrSelfPermission(
@@ -4637,15 +4666,22 @@ public class QcConnectivityService extends ConnectivityService {
         return;
     }
 
+    @Override
     public ProxyProperties getProxy() {
-        synchronized (mDefaultProxyLock) {
-            return mDefaultProxyDisabled ? null : mDefaultProxy;
+        // this information is already available as a world read/writable jvm property
+        // so this API change wouldn't have a benifit.  It also breaks the passing
+        // of proxy info to all the JVMs.
+        // enforceAccessPermission();
+        synchronized (mProxyLock) {
+            if (mGlobalProxy != null) return mGlobalProxy;
+            return (mDefaultProxyDisabled ? null : mDefaultProxy);
         }
     }
 
+    @Override
     public void setGlobalProxy(ProxyProperties proxyProperties) {
-        enforceChangePermission();
-        synchronized (mGlobalProxyLock) {
+        enforceConnectivityInternalPermission();
+        synchronized (mProxyLock) {
             if (proxyProperties == mGlobalProxy) return;
             if (proxyProperties != null && proxyProperties.equals(mGlobalProxy)) return;
             if (mGlobalProxy != null && mGlobalProxy.equals(proxyProperties)) return;
@@ -4662,16 +4698,21 @@ public class QcConnectivityService extends ConnectivityService {
                 mGlobalProxy = null;
             }
             ContentResolver res = mContext.getContentResolver();
-            Settings.Global.putString(res, Settings.Global.GLOBAL_HTTP_PROXY_HOST, host);
-            Settings.Global.putInt(res, Settings.Global.GLOBAL_HTTP_PROXY_PORT, port);
-            Settings.Global.putString(res, Settings.Global.GLOBAL_HTTP_PROXY_EXCLUSION_LIST,
-                    exclList);
+            final long token = Binder.clearCallingIdentity();
+            try {
+                Settings.Global.putString(res, Settings.Global.GLOBAL_HTTP_PROXY_HOST, host);
+                Settings.Global.putInt(res, Settings.Global.GLOBAL_HTTP_PROXY_PORT, port);
+                Settings.Global.putString(res, Settings.Global.GLOBAL_HTTP_PROXY_EXCLUSION_LIST,
+                        exclList);
+            } finally {
+                Binder.restoreCallingIdentity(token);
+            }
         }
 
         if (mGlobalProxy == null) {
             proxyProperties = mDefaultProxy;
         }
-        //sendProxyBroadcast(proxyProperties);
+        sendProxyBroadcast(proxyProperties);
     }
 
     private void loadGlobalProxy() {
@@ -4682,14 +4723,19 @@ public class QcConnectivityService extends ConnectivityService {
                 Settings.Global.GLOBAL_HTTP_PROXY_EXCLUSION_LIST);
         if (!TextUtils.isEmpty(host)) {
             ProxyProperties proxyProperties = new ProxyProperties(host, port, exclList);
-            synchronized (mGlobalProxyLock) {
+            synchronized (mProxyLock) {
                 mGlobalProxy = proxyProperties;
             }
         }
     }
 
+    @Override
     public ProxyProperties getGlobalProxy() {
-        synchronized (mGlobalProxyLock) {
+        // this information is already available as a world read/writable jvm property
+        // so this API change wouldn't have a benifit.  It also breaks the passing
+        // of proxy info to all the JVMs.
+        // enforceAccessPermission();
+        synchronized (mProxyLock) {
             return mGlobalProxy;
         }
     }
@@ -4698,11 +4744,12 @@ public class QcConnectivityService extends ConnectivityService {
         if (proxy != null && TextUtils.isEmpty(proxy.getHost())) {
             proxy = null;
         }
-        synchronized (mDefaultProxyLock) {
+        synchronized (mProxyLock) {
             if (mDefaultProxy != null && mDefaultProxy.equals(proxy)) return;
-            if (mDefaultProxy == proxy) return;
+            if (mDefaultProxy == proxy) return; // catches repeated nulls
             mDefaultProxy = proxy;
 
+            if (mGlobalProxy != null) return;
             if (!mDefaultProxyDisabled) {
                 sendProxyBroadcast(proxy);
             }
@@ -4836,7 +4883,7 @@ public class QcConnectivityService extends ConnectivityService {
         throwIfLockdownEnabled();
         try {
             int type = mActiveDefaultNetwork;
-            if (ConnectivityManager.isNetworkTypeValid(type)) {
+            if (ConnectivityManager.isNetworkTypeValid(type) && mNetTrackers[type] != null) {
                 mVpn.protect(socket, mNetTrackers[type].getLinkProperties().getInterfaceName());
                 return true;
             }
@@ -4950,19 +4997,15 @@ public class QcConnectivityService extends ConnectivityService {
             String domains = buffer.toString().trim();
 
             // Apply DNS changes.
-            boolean changed = false;
             synchronized (mDnsLock) {
-                changed = updateDns("VPN", "VPN", addresses, domains);
+                updateDnsLocked("VPN", "VPN", addresses, domains);
                 mDnsOverridden = true;
             }
-            if (changed) {
-                bumpDns();
-            }
 
-            // Temporarily disable the default proxy.
-            synchronized (mDefaultProxyLock) {
+            // Temporarily disable the default proxy (not global).
+            synchronized (mProxyLock) {
                 mDefaultProxyDisabled = true;
-                if (mDefaultProxy != null) {
+                if (mGlobalProxy == null && mDefaultProxy != null) {
                     sendProxyBroadcast(null);
                 }
             }
@@ -4977,9 +5020,9 @@ public class QcConnectivityService extends ConnectivityService {
                     mHandler.sendEmptyMessage(EVENT_RESTORE_DNS);
                 }
             }
-            synchronized (mDefaultProxyLock) {
+            synchronized (mProxyLock) {
                 mDefaultProxyDisabled = false;
-                if (mDefaultProxy != null) {
+                if (mGlobalProxy == null && mDefaultProxy != null) {
                     sendProxyBroadcast(mDefaultProxy);
                 }
             }
@@ -4988,12 +5031,15 @@ public class QcConnectivityService extends ConnectivityService {
 
     @Override
     public boolean updateLockdownVpn() {
-        enforceSystemUid();
+        if (Binder.getCallingUid() != Process.SYSTEM_UID) {
+            Slog.w(TAG, "Lockdown VPN only available to AID_SYSTEM");
+            return false;
+        }
 
         // Tear down existing lockdown if profile was removed
         mLockdownEnabled = LockdownVpnTracker.isEnabled();
         if (mLockdownEnabled) {
-            if (mKeyStore.state() != KeyStore.State.UNLOCKED) {
+            if (!mKeyStore.isUnlocked()) {
                 Slog.w(TAG, "KeyStore locked; unable to create LockdownTracker");
                 return false;
             }
@@ -5024,6 +5070,7 @@ public class QcConnectivityService extends ConnectivityService {
         try {
             if (tracker != null) {
                 mNetd.setFirewallEnabled(true);
+                mNetd.setFirewallInterfaceRule("lo", true);
                 mLockdownTracker = tracker;
                 mLockdownTracker.init();
             } else {
@@ -5040,13 +5087,30 @@ public class QcConnectivityService extends ConnectivityService {
         }
     }
 
-    private static void enforceSystemUid() {
-        final int uid = Binder.getCallingUid();
-        if (uid != Process.SYSTEM_UID) {
-            throw new SecurityException("Only available to AID_SYSTEM");
+    @Override
+    public void supplyMessenger(int networkType, Messenger messenger) {
+        enforceConnectivityInternalPermission();
+
+        if (isNetworkTypeValid(networkType) && mNetTrackers[networkType] != null) {
+            mNetTrackers[networkType].supplyMessenger(messenger);
         }
     }
 
+    @Override
+    public int findConnectionTypeForIface(String iface) {
+        enforceConnectivityInternalPermission();
+
+        if (TextUtils.isEmpty(iface)) return ConnectivityManager.TYPE_NONE;
+        for (NetworkStateTracker tracker : mNetTrackers) {
+            if (tracker != null) {
+                LinkProperties lp = tracker.getLinkProperties();
+                if (lp != null && iface.equals(lp.getInterfaceName())) {
+                    return tracker.getNetworkInfo().getType();
+                }
+            }
+        }
+        return ConnectivityManager.TYPE_NONE;
+    }
 
     public void startCne() {
         try {

@@ -932,10 +932,13 @@ public class QcConnectivityService extends ConnectivityService {
         if (mLockdownTracker != null) {
             info = mLockdownTracker.augmentNetworkInfo(info);
         }
-        if (info.isConnected() == true &&
-                mActiveDefaultNetwork == TYPE_MOBILE &&
+        if (uid > 1000)
+        {
+            if (info.isConnected() == true &&
+                    mActiveDefaultNetwork == TYPE_MOBILE &&
                     info.getType() == TYPE_WIFI) {
-            info.setDetailedState(DetailedState.VERIFYING_POOR_LINK, null, null);
+                info.setDetailedState(DetailedState.VERIFYING_POOR_LINK, null, null);
+            }
         }
         return info;
     }

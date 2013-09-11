@@ -29,6 +29,7 @@ import static android.net.ConnectivityManager.TYPE_ETHERNET;
 import static android.net.ConnectivityManager.TYPE_MOBILE;
 import static android.net.ConnectivityManager.TYPE_WIFI;
 import static android.net.ConnectivityManager.TYPE_WIMAX;
+import static android.net.ConnectivityManager.TYPE_NONE;
 import static android.net.ConnectivityManager.getNetworkTypeName;
 import static android.net.ConnectivityManager.isNetworkTypeValid;
 import static android.net.NetworkPolicyManager.RULE_ALLOW_ALL;
@@ -2883,6 +2884,7 @@ public class QcConnectivityService extends ConnectivityService {
         static final int HSM_HANDLE_REQUEST_NET_TRANSITION_WAKELOCK = HSM_MSG_MIN + 11;
 
         private int myDefaultDnsNet;
+        private int otherDefaultDnsNet;
         // List to track multiple active default networks
         private ConnectedDefaultNetworkSet mConnectedDefaultNetworks;
         //Maximum simultaneous default networks supported in normal operation.
@@ -3271,6 +3273,7 @@ public class QcConnectivityService extends ConnectivityService {
                 mRouteAttributes[TYPE_MOBILE].setMetric(0);
                 //make wifi higher priority dns than 3g by default.
                 myDefaultDnsNet = TYPE_WIFI;
+                otherDefaultDnsNet = TYPE_NONE; //would never match (reset)
             }
 
             @Override
@@ -3484,7 +3487,7 @@ public class QcConnectivityService extends ConnectivityService {
                     {
                         int type = msg.arg1;
                         boolean doReset = (msg.arg2 == 1);
-                        handleConnectivityChange(type, doReset); //private handler
+                        handleConnectivityChange(type, doReset, true); //private handler
                         ret = HANDLED;
                         break;
                     }
@@ -3546,12 +3549,20 @@ public class QcConnectivityService extends ConnectivityService {
                     }
                     case EVENT_REPRIORITIZE_DNS:
                     {
-                        int type = msg.arg1;
-                        if (type != myDefaultDnsNet) {
-                            handleDnsReprioritization(type);
-                        } else {
-                            logw("Dns is already prioritized for network " + type);
+                        int primary = msg.arg1;
+                        int secondary = msg.arg2;
+                        if ( (myDefaultDnsNet != primary) ||
+                                (otherDefaultDnsNet != secondary) )
+                        {
+                            handleDnsReprioritization(primary, secondary);
                         }
+                        else
+                        {
+                            logw("Dns is already prioritized for network" +
+                                    " p " + primary +
+                                    " s " + secondary);
+                        }
+
                         ret = HANDLED;
                         break;
                     }
@@ -3674,22 +3685,26 @@ public class QcConnectivityService extends ConnectivityService {
              */
             private void updateDnsLocked(String iface,
                                          Collection<InetAddress> netDnses, String domains) {
-
                 if (DBG) log(getCurrentState().getName() + " updateDns");
                 boolean changed = false;
                 int last = 0;
                 List<InetAddress> dnses = new ArrayList<InetAddress>();
+                LinkProperties mlp = null;
+                LinkProperties olp = null;
 
-                LinkProperties mlp = mNetTrackers[myDefaultNet].getLinkProperties();
-                LinkProperties olp = mNetTrackers[otherDefaultNet].getLinkProperties();
+                if (null == (mlp = mNetTrackers[myDefaultDnsNet].getLinkProperties() ))
+                {
+                    if (DBG) log("mlp is NULL"); //invalid. should never occur
+                    return;
+                }
 
-                if (mlp != null) dnses.addAll(mlp.getDnses());
+                if (otherDefaultDnsNet != TYPE_NONE) {
+                    olp = mNetTrackers[otherDefaultDnsNet].getLinkProperties();
+                }
+
+                dnses.addAll(mlp.getDnses());
                 if (olp != null) {
-                    if (otherDefaultNet == myDefaultDnsNet) {
-                        dnses.addAll(0, olp.getDnses());
-                    } else {
-                        dnses.addAll(olp.getDnses());
-                    }
+                    dnses.addAll(olp.getDnses());
                 }
 
                 if (dnses.size() == 0 && mDefaultDns != null) {
@@ -3720,20 +3735,16 @@ public class QcConnectivityService extends ConnectivityService {
 
                 if (changed) {
                     try {
-                        if (iface != null && netDnses != null) {
-                            // only update interface dns cache for the changed iface.
-                            mNetd.setDnsServersForInterface( iface,
-                                    NetworkUtils.makeStrings(netDnses), domains );
-                        }
-                        // set appropriate default iface for dns cache
-                        String defDnsIface = null;
-                        if (myDefaultDnsNet == myDefaultNet && mlp != null) {
-                            defDnsIface = mlp.getInterfaceName();
-                        } else if (olp != null) {
-                            defDnsIface = olp.getInterfaceName();
-                        }
-                        if (!TextUtils.isEmpty(defDnsIface)) {
-                            mNetd.setDefaultInterfaceForDns(defDnsIface);
+                        mNetd.setDnsServersForInterface(
+                                                    mlp.getInterfaceName(),
+                                                    NetworkUtils.makeStrings(mlp.getDnses()),
+                                                    mlp.getDomains() );
+                        mNetd.setDefaultInterfaceForDns(mlp.getInterfaceName());
+                        if (olp != null) {
+                            mNetd.setDnsServersForInterface(
+                                                    olp.getInterfaceName(),
+                                                    NetworkUtils.makeStrings(olp.getDnses()),
+                                                    olp.getDomains() );
                         }
                     } catch (Exception e) {
                         if (VDBG) loge("exception setting default dns interface: " + e);
@@ -3744,7 +3755,7 @@ public class QcConnectivityService extends ConnectivityService {
             /**
              * Reprioritizes the specified networks name servers.
              */
-            protected void handleDnsReprioritization (int netType) {
+            protected void handleDnsReprioritization (int netType, int netTypeSecondary) {
 
                 if (DBG) log(getCurrentState().getName() + " handleDnsReprioritization");
                 // only change dns priority for networks we can handle in this state.
@@ -3753,10 +3764,11 @@ public class QcConnectivityService extends ConnectivityService {
                     return;
                 }
 
-                log("Prioritizing Dns for network " + netType);
+                log("Prioritizing Dns for network " + netType + ", " + netTypeSecondary);
 
                 synchronized (mDnsLock) {
                     myDefaultDnsNet = netType;
+                    otherDefaultDnsNet = netTypeSecondary;
                     if (!mDnsOverridden) {
                         updateDnsLocked(null, null, null);
                     }
@@ -3827,8 +3839,9 @@ public class QcConnectivityService extends ConnectivityService {
 
                 if (type == myDefaultNet) {
                     if (myDefaultDnsNet == type) { // reprioritize dns to other
-                        handleDnsReprioritization(otherDefaultNet);
+                        handleDnsReprioritization(otherDefaultNet, TYPE_NONE);
                     }
+
                     mConnectedDefaultNetworks.remove(type);
                     // reset ActiveDefault to other and send broadcast
                     mActiveDefaultNetwork = otherDefaultNet;
@@ -3893,7 +3906,9 @@ public class QcConnectivityService extends ConnectivityService {
                     }
                 }
                 // do this before we broadcast the change - use custom handler
-                handleConnectivityChange(type, doReset);
+                // do not do dnsconfig for other net type
+                boolean doDns = (type == myDefaultNet);
+                handleConnectivityChange(type, doReset, doDns);
 
                 final Intent immediateIntent = new Intent(intent);
                 immediateIntent.setAction(CONNECTIVITY_ACTION_IMMEDIATE);
@@ -3902,7 +3917,7 @@ public class QcConnectivityService extends ConnectivityService {
 
                 // reprioritize dns to remove other net's dnses
                 if (myDefaultDnsNet == type) {
-                    handleDnsReprioritization(myDefaultNet);
+                    handleDnsReprioritization(myDefaultNet, TYPE_NONE);
                 }
                 //Stop tracking other default network
                 mConnectedDefaultNetworks.remove(type);
@@ -3983,7 +3998,11 @@ public class QcConnectivityService extends ConnectivityService {
                 }
                 thisNet.setTeardownRequested(false);
                 updateNetworkSettings(thisNet);
-                handleConnectivityChange(type, false); // private handler
+
+                // private handler
+                // do not do dnsconfig for other net type
+                boolean doDns = (type == myDefaultNet);
+                handleConnectivityChange(type, false, doDns);
                 if (type != otherDefaultNet) { // squelch broadcast for other default net
                     sendConnectedBroadcastDelayed(info, getConnectivityChangeDelay());
                 } else if (type == TYPE_WIFI) {
@@ -4091,14 +4110,16 @@ public class QcConnectivityService extends ConnectivityService {
              * according to which networks are connected, and ensuring that the
              * right routing table entries exist.
              */
-            private void handleConnectivityChange(int netType, boolean doReset) {
-                int resetMask = doReset ? NetworkUtils.RESET_ALL_ADDRESSES : 0;
+            private void handleConnectivityChange(int netType, boolean doReset,
+                                                  boolean doDns) {
 
-                /*
-                 * If a non-default network is enabled, add the host routes that
-                 * will allow it's DNS servers to be accessed.
-                 */
-                handleDnsConfigurationChange(netType); //use custom handler
+                if (DBG) log(getCurrentState().getName() + " handleConnectivityChange");
+                int resetMask = doReset ? NetworkUtils.RESET_ALL_ADDRESSES : 0;
+                 //If a non-default network is enabled, add the host routes that
+                 //will allow it's DNS servers to be accessed.
+                if (doDns) {
+                    handleDnsConfigurationChange(netType); // use custom handler
+                }
 
                 LinkProperties curLp = mCurrentLinkProperties[netType];
                 LinkProperties newLp = null;

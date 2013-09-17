@@ -2910,6 +2910,8 @@ public class QcConnectivityService extends ConnectivityService {
         static final int HSM_HANDLE_CAPTIVE_PORTAL_CHECK = HSM_MSG_MIN + 10;
         // handleRequestNetworkTransitionWakelock
         static final int HSM_HANDLE_REQUEST_NET_TRANSITION_WAKELOCK = HSM_MSG_MIN + 11;
+        // handleSubTypeChange
+        static final int HSM_HANDLE_SUBTYPE_CHANGED = HSM_MSG_MIN + 12;
 
         private int myDefaultDnsNet;
         private int otherDefaultDnsNet;
@@ -3117,7 +3119,9 @@ public class QcConnectivityService extends ConnectivityService {
                 case NetworkStateTracker.EVENT_NETWORK_SUBTYPE_CHANGED:
                 {
                     info = (NetworkInfo) msg.obj;
-                    updateNetworkSettings(mNetTrackers[info.getType()]);
+                    sendMessageAtFrontOfQueue(obtainMessage(
+                                HSM_HANDLE_SUBTYPE_CHANGED,
+                                info.getType(), 0));
                     break;
                 }
                 case EVENT_CLEAR_NET_TRANSITION_WAKELOCK:
@@ -3292,6 +3296,12 @@ public class QcConnectivityService extends ConnectivityService {
                         if (mActiveDefaultNetwork != -1) {
                             handleDnsConfigurationChange(mActiveDefaultNetwork);
                         }
+                        break;
+                    }
+                    case HSM_HANDLE_SUBTYPE_CHANGED:
+                    {
+                        int type = msg.arg1;
+                        updateNetworkSettings(mNetTrackers[type]);
                         break;
                     }
                     default:
@@ -3624,6 +3634,18 @@ public class QcConnectivityService extends ConnectivityService {
                         ret = HANDLED;
                         break;
                     }
+                    case HSM_HANDLE_SUBTYPE_CHANGED:
+                    {
+                        int type =  msg.arg1;
+                        if (type == myDefaultNet) {
+                            updateNetworkSettings(mNetTrackers[myDefaultNet]);
+                        } else {
+                            logd("ingoring subType change for other default net");
+                        }
+                        ret = HANDLED;
+                        break;
+                    }
+
                     default:
                         ret = NOT_HANDLED;
                         if (DBG) {
@@ -3720,6 +3742,9 @@ public class QcConnectivityService extends ConnectivityService {
                     */
                     QcConnectivityService.this.handleApplyDefaultProxy(
                         mNetTrackers[myDefaultNet].getLinkProperties().getHttpProxy());
+                    // update the TCP params to new default net
+                    // before announcing connectivity switch
+                    updateNetworkSettings(mNetTrackers[myDefaultNet]);
                     sendConnectivitySwitchBroadcast(reason);
                 } else {
                     //pre switch handling in old state
@@ -3899,6 +3924,9 @@ public class QcConnectivityService extends ConnectivityService {
                     mActiveDefaultNetwork = otherDefaultNet;
                     NetworkInfo otherInfo = mNetTrackers[mActiveDefaultNetwork].getNetworkInfo();
                     otherInfo.setFailover(true);
+                    // update the TCP params to the updated mActiveDefaultNetwork
+                    // before sending broadcast
+                    updateNetworkSettings(mNetTrackers[mActiveDefaultNetwork]);
                     sendConnectedBroadcast(otherInfo);
                     return -1; // defer and transition to parent
                 }
@@ -4049,8 +4077,9 @@ public class QcConnectivityService extends ConnectivityService {
                     mOtherInetConditionChangeInFlight = false;
                 }
                 thisNet.setTeardownRequested(false);
-                updateNetworkSettings(thisNet);
-
+                if (type == myDefaultNet) {
+                    updateNetworkSettings(thisNet);
+                }
                 // private handler
                 // do not do dnsconfig for other net type
                 boolean doDns = (type == myDefaultNet);
@@ -4060,7 +4089,6 @@ public class QcConnectivityService extends ConnectivityService {
                 } else if (type == TYPE_WIFI) {
                     sendConnectivityUpBroadcast(type);
                 }
-
                 // notify battery stats service about this network
                 final String iface = thisNet.getLinkProperties().getInterfaceName();
                 if (iface != null) {

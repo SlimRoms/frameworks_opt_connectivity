@@ -1,6 +1,6 @@
 ifeq ($(BOARD_USES_QCNE),true)
 ifneq ($(BUILD_TINY_ANDROID),true)
-ifeq ($(call is-vendor-board-platform,QCOM),true)
+ifneq (,$(filter $(QCOM_BOARD_PLATFORMS),$(TARGET_BOARD_PLATFORM)))
 
 LOCAL_PATH := $(call my-dir)
 

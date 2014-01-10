@@ -739,6 +739,7 @@ public class QcConnectivityService extends ConnectivityService {
 
         // start network sampling ..
         Intent intent = new Intent(ACTION_PKT_CNT_SAMPLE_INTERVAL_ELAPSED, null);
+        intent.addFlags(Intent.FLAG_RECEIVER_REGISTERED_ONLY_BEFORE_BOOT);
         mSampleIntervalElapsedIntent = PendingIntent.getBroadcast(mContext,
                 SAMPLE_INTERVAL_ELAPSED_REQUEST_CODE, intent, 0);
 
@@ -5215,7 +5216,7 @@ public class QcConnectivityService extends ConnectivityService {
         Slog.v(TAG, s);
     }
 
-    public int convertFeatureToNetworkType(int networkType, String feature) {
+    int convertFeatureToNetworkType(int networkType, String feature) {
         int usedNetworkType = networkType;
 
         if(networkType == ConnectivityManager.TYPE_MOBILE) {

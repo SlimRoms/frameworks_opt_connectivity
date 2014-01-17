@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2013 The Linux Foundation. All rights reserved
+ * Copyright (c) 2013-2014 The Linux Foundation. All rights reserved
  * Not a Contribution.
  *
  * Copyright (C) 2008 The Android Open Source Project
@@ -4146,6 +4146,9 @@ public class QcConnectivityService extends ConnectivityService {
                     if (myDefaultDnsNet == type) { // reprioritize dns to other
                         handleDnsReprioritization(otherDefaultNet, TYPE_NONE);
                     }
+
+                    // remove default route first
+                    removeDefaultRoutes(myDefaultNet);
                     //reset metric for other default net to 0 as it is the only
                     //connected network.
                     mRouteAttributes[otherDefaultNet].setMetric(0);

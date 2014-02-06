@@ -2406,7 +2406,12 @@ public class QcConnectivityService extends ConnectivityService {
         }
         thisNet.setTeardownRequested(false);
         updateNetworkSettings(thisNet);
-        updateMtuSizeSettings(thisNet);
+        if (ConnectivityManager.isNetworkTypeMobile(newNetType)) {
+          // Skip MTU update here. Let Radio implementation
+          // handle this.
+        } else {
+           updateMtuSizeSettings(thisNet);
+        }
         handleConnectivityChange(newNetType, false);
         sendConnectedBroadcastDelayed(info, getConnectivityChangeDelay());
 

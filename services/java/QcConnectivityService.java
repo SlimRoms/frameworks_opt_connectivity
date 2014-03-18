@@ -2051,6 +2051,11 @@ public class QcConnectivityService extends ConnectivityService {
             } else {
                 mDefaultInetConditionPublished = 0; // we're not connected anymore
                 intent.putExtra(ConnectivityManager.EXTRA_NO_CONNECTIVITY, true);
+                try { //clear default dns from resolver cache
+                    mNetd.setDefaultInterfaceForDns("");
+                } catch (Exception e) {
+                    loge("exception when try to clear default interface for DNS", e);
+                }
             }
         }
         intent.putExtra(ConnectivityManager.EXTRA_INET_CONDITION, mDefaultInetConditionPublished);

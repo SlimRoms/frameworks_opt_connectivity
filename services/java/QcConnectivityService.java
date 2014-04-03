@@ -4171,6 +4171,8 @@ public class QcConnectivityService extends ConnectivityService {
                     otherInfo.setFailover(true);
                     // update the TCP params to the updated mActiveDefaultNetwork
                     // before sending broadcast
+                    QcConnectivityService.this.handleApplyDefaultProxy(
+                            mNetTrackers[mActiveDefaultNetwork].getLinkProperties().getHttpProxy());
                     updateNetworkSettings(mNetTrackers[mActiveDefaultNetwork]);
                     sendConnectedBroadcast(otherInfo);
                     return -1; // defer and transition to parent

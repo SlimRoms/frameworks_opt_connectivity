@@ -263,6 +263,14 @@ public class QcConnectivityService extends ConnectivityService {
     private INetworkManagementService mNetd;
     private INetworkPolicyManager mPolicyManager;
 
+    /*
+     * change default sampling interval to MAX integer to prevent UE
+     * wake up every 12 minutes to save power consumption.
+     * this line overrides the value of DEFAULT_SAMPLING_INTERVAL_IN_SECONDS
+     * in ConnectivityService.java
+     */
+    protected static final int DEFAULT_SAMPLING_INTERVAL_IN_SECONDS =
+        (VDBG ? 30 : Integer.MAX_VALUE);
     private static final int MAX_NETWORK_STATE_TRACKER_EVENT = 100;
 
     /**

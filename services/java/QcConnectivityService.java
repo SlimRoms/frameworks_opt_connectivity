@@ -265,14 +265,6 @@ public class QcConnectivityService extends ConnectivityService {
     private INetworkManagementService mNetd;
     private INetworkPolicyManager mPolicyManager;
 
-    /*
-     * change default sampling interval to MAX integer to prevent UE
-     * wake up every 12 minutes to save power consumption.
-     * this line overrides the value of DEFAULT_SAMPLING_INTERVAL_IN_SECONDS
-     * in ConnectivityService.java
-     */
-    protected static final int DEFAULT_SAMPLING_INTERVAL_IN_SECONDS =
-        (VDBG ? 30 : Integer.MAX_VALUE);
     private static final int MAX_NETWORK_STATE_TRACKER_EVENT = 100;
 
     /**
@@ -6627,13 +6619,23 @@ public class QcConnectivityService extends ConnectivityService {
 
         log("Done.");
 
+
         int samplingIntervalInSeconds = Settings.Global.getInt(mContext.getContentResolver(),
                 Settings.Global.CONNECTIVITY_SAMPLING_INTERVAL_IN_SECONDS,
                 DEFAULT_SAMPLING_INTERVAL_IN_SECONDS);
 
-        if (DBG) log("Setting timer for " + String.valueOf(samplingIntervalInSeconds) + "seconds");
+        // Only setAlarm if CONNECTIVITY_SAMPLING_INTERVAL_IN_SECONDS is set in
+        // Settings.db or VDBG is true. Otherwise, DEFAULT_SAMPLING_INTERVAL_IN_SECONDS
+        // is set to -1 by default in ConnectivityService.java.
+        // By setting to -1, it disables setAlarm to reduce power consumption
+        // as currently there is no user of these sampled statistics.
+        if ( samplingIntervalInSeconds > 0 ){
+            if (DBG) log("Setting timer for " +
+                         String.valueOf(samplingIntervalInSeconds) + "seconds");
 
-        setAlarm(samplingIntervalInSeconds * 1000, mSampleIntervalElapsedIntent);
+            setAlarm(samplingIntervalInSeconds * 1000, mSampleIntervalElapsedIntent);
+        }
+
     }
 
     @Override

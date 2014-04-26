@@ -2083,12 +2083,14 @@ public class QcConnectivityService extends ConnectivityService {
          * in accordance with network preference policies.
          */
         if (!mNetConfigs[prevNetType].isDefault()) {
-            List<Integer> pids = mNetRequestersPids[prevNetType];
-            for (Integer pid : pids) {
-                // will remove them because the net's no longer connected
-                // need to do this now as only now do we know the pids and
-                // can properly null things that are no longer referenced.
-                reassessPidDns(pid.intValue(), false);
+            synchronized(this) {
+                List<Integer> pids = mNetRequestersPids[prevNetType];
+                for (Integer pid : pids) {
+                    // will remove them because the net's no longer connected
+                    // need to do this now as only now do we know the pids and
+                    // can properly null things that are no longer referenced.
+                    reassessPidDns(pid.intValue(), false);
+                }
             }
         }
 
@@ -3045,12 +3047,14 @@ public class QcConnectivityService extends ConnectivityService {
                     if (DBG) loge("exception setting dns servers: " + e);
                 }
                 // set per-pid dns for attached secondary nets
-                List<Integer> pids = mNetRequestersPids[netType];
-                for (Integer pid : pids) {
-                    try {
-                        mNetd.setDnsInterfaceForPid(p.getInterfaceName(), pid);
-                    } catch (Exception e) {
-                        Slog.e(TAG, "exception setting interface for pid: " + e);
+                synchronized(this) {
+                    List<Integer> pids = mNetRequestersPids[netType];
+                    for (Integer pid : pids) {
+                        try {
+                            mNetd.setDnsInterfaceForPid(p.getInterfaceName(), pid);
+                        } catch (Exception e) {
+                            Slog.e(TAG, "exception setting interface for pid: " + e);
+                        }
                     }
                 }
             }
@@ -4181,12 +4185,14 @@ public class QcConnectivityService extends ConnectivityService {
                             if (DBG) loge("exception setting dns servers: " + e);
                         }
                         // set per-pid dns for attached secondary nets
-                        List<Integer> pids = mNetRequestersPids[netType];
-                        for (Integer pid : pids) {
-                            try {
-                                mNetd.setDnsInterfaceForPid(p.getInterfaceName(), pid);
-                            } catch (Exception e) {
-                                Slog.e(TAG, "exception setting interface for pid: " + e);
+                        synchronized(this) {
+                            List<Integer> pids = mNetRequestersPids[netType];
+                            for (Integer pid : pids) {
+                                try {
+                                    mNetd.setDnsInterfaceForPid(p.getInterfaceName(), pid);
+                                } catch (Exception e) {
+                                    Slog.e(TAG, "exception setting interface for pid: " + e);
+                                }
                             }
                         }
                     }

@@ -5357,8 +5357,7 @@ public class QcConnectivityService extends ConnectivityService {
             int user = UserHandle.getUserId(Binder.getCallingUid());
             if (ConnectivityManager.isNetworkTypeValid(type) && mNetTrackers[type] != null) {
                 synchronized(mVpns) {
-                    mVpns.get(user).protect(socket,
-                            mNetTrackers[type].getLinkProperties().getInterfaceName());
+                    mVpns.get(user).protect(socket);
                 }
                 return true;
             }
@@ -5596,7 +5595,7 @@ public class QcConnectivityService extends ConnectivityService {
                 boolean forwardDns) {
             try {
                 mNetd.clearUidRangeRoute(interfaze, uidStart, uidEnd);
-                if (forwardDns) mNetd.clearDnsInterfaceForUidRange(uidStart, uidEnd);
+                if (forwardDns) mNetd.clearDnsInterfaceForUidRange(interfaze, uidStart, uidEnd);
             } catch (RemoteException e) {
             }
 
